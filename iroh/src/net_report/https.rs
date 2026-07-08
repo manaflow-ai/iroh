@@ -1,6 +1,5 @@
-//! HTTPS latency probes for net_report.
+//! HTTPS latency probe execution.
 
-#[cfg(not(wasm_browser))]
 use std::net::SocketAddr;
 
 use http::StatusCode;
@@ -14,7 +13,6 @@ use n0_future::{
     time::{Duration, Instant},
 };
 use tracing::trace;
-#[cfg(not(wasm_browser))]
 use url::Host;
 
 #[cfg(not(wasm_browser))]
@@ -23,10 +21,22 @@ use super::defaults::timeouts::DNS_TIMEOUT;
 use crate::address_lookup::DNS_STAGGERING_MS;
 use crate::util::reqwest_client_builder;
 
+#[allow(missing_docs)]
+#[stack_error(derive, add_meta)]
+#[non_exhaustive]
+pub(super) enum HttpsProbeError {
+    #[error("HTTPS probe failed")]
+    ProbeFailure { source: MeasureHttpsLatencyError },
+    #[error("Probe cancelled")]
+    Cancelled,
+    #[error("Probe timed out")]
+    Timeout,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct HttpsProbeReport {
-    /// The relay that was probed
-    pub(super) relay: RelayUrl,
+    /// The relay that was probed.
+    pub(super) relay_url: RelayUrl,
     /// The latency to the relay.
     pub(super) latency: Duration,
 }
@@ -61,10 +71,11 @@ pub(super) enum MeasureHttpsLatencyError {
 
 /// Executes an HTTPS probe.
 ///
-/// If `certs` is provided they will be added to the trusted root certificates, allowing the
-/// use of self-signed certificates for servers.  Currently this is used for testing.
+/// Sends a GET request to the relay's probe endpoint and measures the
+/// round-trip time. DNS resolution goes through our own resolver (on
+/// native targets) so it follows the same path as relay client connections.
 #[allow(clippy::unused_async)]
-pub(super) async fn run_https_probe(
+pub(super) async fn run_probe(
     #[cfg(not(wasm_browser))] dns_resolver: &DnsResolver,
     relay: RelayUrl,
     #[cfg(not(wasm_browser))] tls_config: rustls::ClientConfig,
@@ -76,14 +87,10 @@ pub(super) async fn run_https_probe(
     // needs to be more configurable so users can do more crazy things:
     // https://github.com/n0-computer/iroh/issues/2901
     #[cfg(not(wasm_browser))]
-    let mut builder = reqwest_client_builder(tls_config, dns_resolver.clone());
+    let mut builder = reqwest_client_builder(tls_config, dns_resolver.clone())
+        .redirect(reqwest::redirect::Policy::none());
     #[cfg(wasm_browser)]
     let mut builder = reqwest_client_builder();
-
-    #[cfg(not(wasm_browser))]
-    {
-        builder = builder.redirect(reqwest::redirect::Policy::none());
-    }
 
     #[cfg(not(wasm_browser))]
     if let Some(Host::Domain(domain)) = url.host() {
@@ -127,7 +134,10 @@ pub(super) async fn run_https_probe(
             }
         }
 
-        Ok(HttpsProbeReport { relay, latency })
+        Ok(HttpsProbeReport {
+            relay_url: relay,
+            latency,
+        })
     } else {
         Err(e!(MeasureHttpsLatencyError::InvalidResponse {
             status: response.status()
@@ -148,7 +158,7 @@ mod tests {
         let (_server, relay) = test_utils::relay().await;
         let dns_resolver = DnsResolver::new();
         tracing::info!(relay_url = ?relay.url , "RELAY_URL");
-        let report = run_https_probe(
+        let report = run_probe(
             &dns_resolver,
             relay.url,
             CaTlsConfig::insecure_skip_verify()
