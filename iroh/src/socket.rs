@@ -913,11 +913,18 @@ impl EndpointInner {
             // If we would, the `noq::Endpoint` passed along will not have IP connectivity,
             // and the QAD probes that connect to the relay's QUIC endpoints would time out
             // because all outgoing packets to IP destinations would be dropped.
-            let qad_config = has_ip_transports.then(|| QuicConfig {
-                ep: endpoint.clone(),
-                client_config: tls_config.clone(),
-                ipv4: true,
-                ipv6: has_ipv6_transport,
+            let qad_config = has_ip_transports.then(|| {
+                // EXPERIMENTAL (reconnect-with-resumption): ensure TLS session
+                // resumption is enabled so each per-cycle QAD reconnect can
+                // resume a prior session and skip the handshake crypto.
+                let mut client_config = tls_config.clone();
+                client_config.resumption = rustls::client::Resumption::default();
+                QuicConfig {
+                    ep: endpoint.clone(),
+                    client_config,
+                    ipv4: true,
+                    ipv6: has_ipv6_transport,
+                }
             });
             net_report::Options::new(tls_config.clone())
                 .quic_config(qad_config)

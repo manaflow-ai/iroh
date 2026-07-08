@@ -53,4 +53,9 @@ pub(in crate::net_report) mod timeouts {
     /// Cycle cadence after which the next probe cycle is forced to be `Full`
     /// rather than `Refresh`. Not a timeout in the "cancellation" sense.
     pub(in crate::net_report) const FULL_REPORT_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+    /// EXPERIMENTAL (reconnect-with-resumption): how long to keep a QAD
+    /// connection open after the address arrives, long enough for the server's
+    /// session ticket to arrive so the next reconnect can resume, then close.
+    pub(in crate::net_report) const QAD_LINGER: Duration = Duration::from_secs(1);
 }

@@ -26,7 +26,11 @@ use iroh_relay::{
 use n0_error::{e, stack_error};
 #[cfg(not(wasm_browser))]
 use n0_future::task;
-use n0_future::{StreamExt, task::AbortOnDropHandle, time::Duration};
+use n0_future::{
+    StreamExt,
+    task::AbortOnDropHandle,
+    time::{self, Duration},
+};
 #[cfg(not(wasm_browser))]
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +39,7 @@ use tracing::trace;
 #[cfg(not(wasm_browser))]
 use super::actor::ProbeEvent;
 #[cfg(not(wasm_browser))]
-use super::defaults::timeouts::DNS_TIMEOUT;
+use super::defaults::timeouts::{DNS_TIMEOUT, QAD_LINGER};
 #[cfg(not(wasm_browser))]
 use crate::address_lookup::DNS_STAGGERING_MS;
 
@@ -244,21 +248,29 @@ pub(super) async fn run_probe(
     let handle = task::spawn(shutdown_token.run_until_cancelled_owned({
         let conn = conn.clone();
         async move {
-            while let Some(val) = watcher.next().await {
-                let val = SocketAddr::new(val.ip().to_canonical(), val.port());
-                let latency = conn.rtt(PathId::ZERO).unwrap_or_default();
-                // Forward to the actor so a changed address reaches callers
-                // right away; the actor also keeps it for the next cycle.
-                let report = QadProbeReport {
-                    relay_url: relay_url.clone(),
-                    addr: val,
-                    latency,
-                };
-                events
-                    .send(ProbeEvent::QadObservation(family, report))
-                    .await
-                    .ok();
-            }
+            // EXPERIMENTAL (reconnect-with-resumption): rather than hold this
+            // connection open indefinitely and stream address changes, keep it
+            // only briefly so the server's session ticket can arrive (making
+            // the next reconnect cheap), forward any observations that show up
+            // meanwhile, then close. The actor sees the closed connection on
+            // the next cycle and re-probes, resuming the TLS session.
+            let _ = time::timeout(QAD_LINGER, async {
+                while let Some(val) = watcher.next().await {
+                    let val = SocketAddr::new(val.ip().to_canonical(), val.port());
+                    let latency = conn.rtt(PathId::ZERO).unwrap_or_default();
+                    let report = QadProbeReport {
+                        relay_url: relay_url.clone(),
+                        addr: val,
+                        latency,
+                    };
+                    events
+                        .send(ProbeEvent::QadObservation(family, report))
+                        .await
+                        .ok();
+                }
+            })
+            .await;
+            conn.close(QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON);
         }
     }));
     let handle = AbortOnDropHandle::new(handle);
