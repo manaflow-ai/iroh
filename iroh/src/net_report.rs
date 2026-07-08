@@ -7,7 +7,7 @@
 
 #![cfg_attr(wasm_browser, allow(unused))]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 #[cfg(not(wasm_browser))]
 use iroh_dns::dns::DnsResolver;
@@ -69,8 +69,8 @@ pub(super) struct SharedContext {
 
 /// Configuration for the net report component.
 ///
-/// Controls which probes and checks are performed when generating network reports.
-/// All options default to `true`.
+/// Controls which probes and checks are performed when generating network
+/// reports, and how they are paced.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct NetReportConfig {
@@ -96,6 +96,18 @@ pub struct NetReportConfig {
     /// When we have detected that we are behind a captive portal, we try to contact
     /// the relay servers more frequently in case the captive portal status changes.
     pub captive_portal_check: bool,
+
+    /// Delay inserted between successive QAD probes within a report cycle.
+    ///
+    /// A cycle runs QUIC address discovery against several relays. By default
+    /// those probes all start at once, a brief burst of QUIC handshakes. On
+    /// resource-constrained devices (an ESP32, say) that burst is disruptive,
+    /// so a non-zero value spreads the probes out: the first still starts
+    /// immediately, and each following one is delayed by a further multiple
+    /// of this duration. Setting it does not delay the first result.
+    ///
+    /// Defaults to [`Duration::ZERO`], which keeps the all-at-once behavior.
+    pub qad_stagger: Duration,
 }
 
 impl NetReportConfig {
@@ -104,6 +116,7 @@ impl NetReportConfig {
         Self {
             https_probes: false,
             captive_portal_check: false,
+            qad_stagger: Duration::ZERO,
         }
     }
 }
@@ -113,6 +126,7 @@ impl Default for NetReportConfig {
         Self {
             https_probes: true,
             captive_portal_check: true,
+            qad_stagger: Duration::ZERO,
         }
     }
 }
@@ -185,6 +199,8 @@ impl Client {
             protocols,
             #[cfg(not(wasm_browser))]
             opts.user_config.captive_portal_check,
+            #[cfg(not(wasm_browser))]
+            opts.user_config.qad_stagger,
             shutdown,
             metrics,
         );

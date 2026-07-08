@@ -4,9 +4,11 @@
 //! A QAD probe opens a QUIC connection to a relay. The relay reports the
 //! public socket address it sees us coming from, which is where other peers
 //! can try to reach us directly, and the round trip gives us our latency to
-//! that relay. The connection then stays open: whenever the relay sees a new
-//! address for us, it reports that too, so an address change reaches us
-//! without opening another connection.
+//! that relay. The connection then stays open with a keep-alive. Because the
+//! relay only sees our address from the packets we send, it reports a change
+//! on the connection's next keep-alive rather than the instant our address
+//! changes. Keeping the connection open avoids a fresh handshake each time we
+//! need the current address.
 
 use std::{
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6},

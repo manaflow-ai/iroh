@@ -14,10 +14,12 @@
 //! QAD connections are long-lived, and that shapes the rest. For each
 //! address family the actor races a probe to several relays, keeps the
 //! connection that answers first, and closes the others. It then holds that
-//! connection open: the relay reports a new address whenever ours changes,
-//! so an address change reaches callers without a new probe. These
-//! observations arrive on the same [`ProbeEvent`] channel as probe results,
-//! so everything the actor learns lands in one place.
+//! connection open. The relay only sees our address from the packets we
+//! send, so a change is not reported the instant it happens: the
+//! connection's keep-alive prompts the relay to re-observe within seconds,
+//! and a network change we notice ourselves starts a fresh probe at once.
+//! Either way the update arrives on the same [`ProbeEvent`] channel as probe
+//! results, so everything the actor learns lands in one place.
 //!
 //! A probe cycle is a round of probing triggered by a request. Because the
 //! open QAD connections already keep addresses current, a cycle is mostly
@@ -157,9 +159,10 @@ pub(super) enum ProbeEvent {
 /// request waits for the current cycle to finish. On the cycle itself it
 /// says how much to probe.
 ///
-/// The open QAD connections keep our address current on their own (see the
-/// [module docs](self)), so neither scope has to probe QAD just to stay up
-/// to date. The difference is what else a cycle does:
+/// The open QAD connections keep our address up to date on their own, within
+/// their keep-alive interval (see the [module docs](self)), so neither scope
+/// has to probe QAD just to stay current. The difference is what else a cycle
+/// does:
 ///
 /// - `Full` throws away the open QAD connections and starts from nothing. It
 ///   opens a fresh QAD connection for every available family, measures
@@ -344,6 +347,11 @@ pub(super) struct NetReportActor {
     /// Whether to run captive portal detection on full cycles.
     #[cfg(not(wasm_browser))]
     captive_portal_check: bool,
+    /// Delay added between successive QAD probes in a cycle. Zero fires them
+    /// all at once; a non-zero value spreads the burst out for constrained
+    /// devices (see [`NetReportConfig::qad_stagger`](super::NetReportConfig)).
+    #[cfg(not(wasm_browser))]
+    qad_stagger: Duration,
 
     /// Owns every one-shot probe task so shutdown aborts them all. Results
     /// arrive through `events`, not `join_next`; this only reaps finished
@@ -382,6 +390,7 @@ impl NetReportActor {
         #[cfg(not(wasm_browser))] tls_config: rustls::ClientConfig,
         protocols: BTreeSet<Probe>,
         #[cfg(not(wasm_browser))] captive_portal_check: bool,
+        #[cfg(not(wasm_browser))] qad_stagger: Duration,
         shutdown: CancellationToken,
         metrics: Arc<Metrics>,
     ) -> Self {
@@ -398,6 +407,8 @@ impl NetReportActor {
             protocols,
             #[cfg(not(wasm_browser))]
             captive_portal_check,
+            #[cfg(not(wasm_browser))]
+            qad_stagger,
             tasks: JoinSet::new(),
             events_tx,
             events,
@@ -803,7 +814,10 @@ impl NetReportActor {
         {
             for (family, needed) in families {
                 if needed {
-                    self.spawn_qad_probe(family, relay.clone(), quic_client.clone());
+                    // Stagger successive probes so they do not all fire at
+                    // once. The first probe (count == 0) starts immediately.
+                    let delay = self.qad_stagger * count as u32;
+                    self.spawn_qad_probe(family, relay.clone(), quic_client.clone(), delay);
                     count += 1;
                 }
             }
@@ -817,6 +831,7 @@ impl NetReportActor {
         family: AddrFamily,
         relay: Arc<iroh_relay::RelayConfig>,
         quic_client: iroh_relay::quic::QuicClient,
+        delay: Duration,
     ) {
         use tracing::{Instrument, info_span};
 
@@ -825,21 +840,30 @@ impl NetReportActor {
         let shutdown = self.shutdown.child_token();
         let cancel = self.qad_conns.cancel(family).child_token();
         let events = self.events_tx.clone();
+        let probe_events = events.clone();
         let span = info_span!("QAD", ?family, %relay_url);
         self.tasks.spawn(
             async move {
+                // The stagger delay is outside the timeout so each probe still
+                // gets the full QAD_PROBE_TIMEOUT once it starts.
                 let outcome = cancel
-                    .run_until_cancelled(time::timeout(
-                        QAD_PROBE_TIMEOUT,
-                        super::qad::run_probe(
-                            family,
-                            relay,
-                            quic_client,
-                            dns_resolver,
-                            shutdown,
-                            events.clone(),
-                        ),
-                    ))
+                    .run_until_cancelled(async move {
+                        if !delay.is_zero() {
+                            time::sleep(delay).await;
+                        }
+                        time::timeout(
+                            QAD_PROBE_TIMEOUT,
+                            super::qad::run_probe(
+                                family,
+                                relay,
+                                quic_client,
+                                dns_resolver,
+                                shutdown,
+                                probe_events,
+                            ),
+                        )
+                        .await
+                    })
                     .await;
                 let result = match outcome {
                     Some(Ok(Ok(x))) => Ok(x),
