@@ -53,7 +53,7 @@ use super::{
         ABORT_TIMEOUT, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, FIRST_REPORT_TIMEOUT,
         FULL_REPORT_INTERVAL, HTTPS_PROBE_TIMEOUT,
     },
-    https::{HttpsProbeError, HttpsProbeReport},
+    https::{HttpsProbeReport, MeasureHttpsLatencyError},
     metrics::Metrics,
     probes::{Probe, ProbePlan},
     report::RelayLatencies,
@@ -64,25 +64,31 @@ use super::{SharedContext, defaults::timeouts::QAD_PROBE_TIMEOUT};
 /// Capacity of the actor's event channel.
 const EVENT_CHANNEL_CAP: usize = 64;
 
-/// How a probe's inner future ended: it produced a value, timed out, or was
-/// cancelled.
-enum ProbeRun<T> {
-    Done(T),
-    TimedOut,
+/// The outcome of running a probe under a timeout and a cancellation token: it
+/// succeeded, failed with the probe's own error, timed out, or was cancelled.
+/// Keeping timeout and cancellation out of the probe's error type lets each
+/// error stay a pure domain error.
+pub(super) enum ProbeOutcome<T, E> {
+    Ok(T),
+    Err(E),
+    Timeout,
     Cancelled,
 }
 
 /// Runs a probe future under `cancel`, an optional leading `delay`, and a
-/// `timeout`, normalizing the three ways it can end.
+/// `timeout`.
 ///
 /// The delay is applied before the timeout starts, so a staggered probe still
 /// gets the full timeout once it begins.
-async fn run_probe_task<F: Future>(
+async fn run_probe_task<T, E, F>(
     cancel: &CancellationToken,
     delay: Duration,
     timeout: Duration,
     work: F,
-) -> ProbeRun<F::Output> {
+) -> ProbeOutcome<T, E>
+where
+    F: Future<Output = Result<T, E>>,
+{
     let outcome = cancel
         .run_until_cancelled(async move {
             if !delay.is_zero() {
@@ -92,9 +98,10 @@ async fn run_probe_task<F: Future>(
         })
         .await;
     match outcome {
-        Some(Ok(value)) => ProbeRun::Done(value),
-        Some(Err(_elapsed)) => ProbeRun::TimedOut,
-        None => ProbeRun::Cancelled,
+        Some(Ok(Ok(value))) => ProbeOutcome::Ok(value),
+        Some(Ok(Err(err))) => ProbeOutcome::Err(err),
+        Some(Err(_elapsed)) => ProbeOutcome::Timeout,
+        None => ProbeOutcome::Cancelled,
     }
 }
 
@@ -174,12 +181,15 @@ pub(super) enum ProbeEvent {
     /// A QAD probe finished. On success it carries the connection to keep
     /// open.
     #[cfg(not(wasm_browser))]
-    QadResult(AddrFamily, Result<(QadProbeReport, QadConn), QadProbeError>),
+    QadResult(
+        AddrFamily,
+        ProbeOutcome<(QadProbeReport, QadConn), QadProbeError>,
+    ),
     /// An open QAD connection reported an address, possibly a new one.
     #[cfg(not(wasm_browser))]
     QadObservation(AddrFamily, QadProbeReport),
     /// An HTTPS latency probe finished.
-    Https(Result<HttpsProbeReport, HttpsProbeError>),
+    Https(ProbeOutcome<HttpsProbeReport, MeasureHttpsLatencyError>),
     /// The captive portal check finished (`None` if cancelled or timed out).
     #[cfg(not(wasm_browser))]
     CaptivePortal(Option<bool>),
@@ -230,24 +240,74 @@ impl ProbeScope {
     }
 }
 
-/// The set of QAD address families a cycle probes and has heard back from.
+/// Per-family QAD progress within a cycle.
 #[derive(Debug, Clone, Copy, Default)]
-struct AddrFamilies {
-    v4: bool,
-    v6: bool,
+struct QadFamily {
+    /// This cycle is probing the family.
+    probing: bool,
+    /// The family is determined: it has an address, or all of its probes have
+    /// finished (so the family is genuinely down).
+    determined: bool,
+    /// QAD probes still outstanding for the family.
+    #[cfg(not(wasm_browser))]
+    outstanding: usize,
 }
 
-impl AddrFamilies {
-    /// Returns `true` if every family set in `needed` is also set here.
-    fn covers(self, needed: AddrFamilies) -> bool {
-        (self.v4 || !needed.v4) && (self.v6 || !needed.v6)
+impl QadFamily {
+    /// State for a family with `probes` QAD probes started.
+    fn new(probes: usize) -> Self {
+        QadFamily {
+            probing: probes > 0,
+            determined: false,
+            #[cfg(not(wasm_browser))]
+            outstanding: probes,
+        }
+    }
+}
+
+/// QAD progress for both address families within a cycle.
+#[derive(Debug, Clone, Copy, Default)]
+struct QadState {
+    v4: QadFamily,
+    v6: QadFamily,
+}
+
+impl QadState {
+    /// Builds the cycle's QAD gate state from the number of probes started per
+    /// family.
+    fn new(v4_probes: usize, v6_probes: usize) -> Self {
+        QadState {
+            v4: QadFamily::new(v4_probes),
+            v6: QadFamily::new(v6_probes),
+        }
+    }
+
+    /// Returns `true` once every family this cycle is probing is determined.
+    /// The first report is held until this holds (or [`FIRST_REPORT_TIMEOUT`]
+    /// fires), so consumers do not see a v4-only report a moment before v6.
+    fn all_determined(&self) -> bool {
+        (!self.v4.probing || self.v4.determined) && (!self.v6.probing || self.v6.determined)
+    }
+
+    /// Records that one of `family`'s probes finished with `outcome`.
+    ///
+    /// The family becomes determined on its first success or once all of its
+    /// probes are done, so a fast failure does not gate a premature
+    /// family-negative first report.
+    #[cfg(not(wasm_browser))]
+    fn record_result<T, E>(&mut self, family: AddrFamily, outcome: &ProbeOutcome<T, E>) {
+        let fam = self.family_mut(family);
+        fam.outstanding = fam.outstanding.saturating_sub(1);
+        if matches!(outcome, ProbeOutcome::Ok(_)) || fam.outstanding == 0 {
+            fam.determined = true;
+        }
     }
 
     #[cfg(not(wasm_browser))]
-    fn set(&mut self, family: AddrFamily) {
+    fn family_mut(&mut self, family: AddrFamily) -> &mut QadFamily {
         match family {
-            AddrFamily::V4 => self.v4 = true,
-            AddrFamily::V6 => self.v6 = true,
+            AddrFamily::V4 => &mut self.v4,
+            AddrFamily::V6 => &mut self.v6,
         }
     }
 }
@@ -364,19 +424,8 @@ struct ProbeCycle {
     started: Instant,
     /// Probe tasks that have not yet reported a terminal result.
     pending: usize,
-    /// QAD families this cycle is probing. The first report is held until each
-    /// is determined (see `determined`) or [`FIRST_REPORT_TIMEOUT`] fires.
-    expected: AddrFamilies,
-    /// QAD families that are determined: they have an address, or all of their
-    /// probes have finished (so the family is genuinely down).
-    determined: AddrFamilies,
-    /// QAD probes still outstanding per family. A family becomes determined on
-    /// its first success or once this reaches zero, so we never publish a
-    /// family-negative first report while a success may still arrive.
-    #[cfg(not(wasm_browser))]
-    qad_outstanding_v4: usize,
-    #[cfg(not(wasm_browser))]
-    qad_outstanding_v6: usize,
+    /// Per-family QAD progress, used to gate the first report.
+    qad: QadState,
     /// Whether the first report of this cycle has been published yet.
     published: bool,
     /// A `Refresh` request that arrived mid-cycle, run when this one ends.
@@ -385,17 +434,6 @@ struct ProbeCycle {
     report_deadline: Option<Instant>,
     /// Fires at [`ABORT_TIMEOUT`]; `None` once fired.
     abort_deadline: Option<Instant>,
-}
-
-#[cfg(not(wasm_browser))]
-impl ProbeCycle {
-    /// The count of QAD probes still outstanding for `family`.
-    fn qad_outstanding(&mut self, family: AddrFamily) -> &mut usize {
-        match family {
-            AddrFamily::V4 => &mut self.qad_outstanding_v4,
-            AddrFamily::V6 => &mut self.qad_outstanding_v6,
-        }
-    }
 }
 
 /// Actor that owns all probe state and emits report updates via
@@ -616,16 +654,7 @@ impl NetReportActor {
         let (qad_v4, qad_v6) = self.spawn_qad_probes(&if_state);
         #[cfg(wasm_browser)]
         let (qad_v4, qad_v6) = (0usize, 0usize);
-        let mut expected = AddrFamilies::default();
-        #[cfg(not(wasm_browser))]
-        {
-            if qad_v4 > 0 {
-                expected.set(AddrFamily::V4);
-            }
-            if qad_v6 > 0 {
-                expected.set(AddrFamily::V6);
-            }
-        }
+        let qad = QadState::new(qad_v4, qad_v6);
         let mut pending = qad_v4 + qad_v6 + self.spawn_https_probes();
         #[cfg(not(wasm_browser))]
         if scope == ProbeScope::Full && self.captive_portal_check {
@@ -636,12 +665,7 @@ impl NetReportActor {
         self.cycle = Some(ProbeCycle {
             started: now,
             pending,
-            expected,
-            determined: AddrFamilies::default(),
-            #[cfg(not(wasm_browser))]
-            qad_outstanding_v4: qad_v4,
-            #[cfg(not(wasm_browser))]
-            qad_outstanding_v6: qad_v6,
+            qad,
             published: false,
             rerun: None,
             report_deadline: Some(now + FIRST_REPORT_TIMEOUT),
@@ -658,23 +682,13 @@ impl NetReportActor {
     fn handle_event(&mut self, ev: ProbeEvent) {
         match ev {
             #[cfg(not(wasm_browser))]
-            ProbeEvent::QadResult(family, result) => {
+            ProbeEvent::QadResult(family, run) => {
                 if let Some(c) = &mut self.cycle {
-                    let remaining = {
-                        let r = c.qad_outstanding(family);
-                        *r = r.saturating_sub(1);
-                        *r
-                    };
-                    // A family is determined once it has a result or all of
-                    // its probes are done, so a fast failure does not publish
-                    // a premature family-negative first report.
-                    if result.is_ok() || remaining == 0 {
-                        c.determined.set(family);
-                    }
+                    c.qad.record_result(family, &run);
                 }
                 self.probe_finished();
-                match result {
-                    Ok((report, conn)) => {
+                match run {
+                    ProbeOutcome::Ok((report, conn)) => {
                         debug!(?family, ?report, "QAD probe completed");
                         // Accumulate: the first result sets the global
                         // address; a second result from a different relay
@@ -696,7 +710,9 @@ impl NetReportActor {
                         // UDP works, so skip captive portal detection.
                         self.cancel_captive_portal.cancel();
                     }
-                    Err(e) => debug!(?family, "QAD probe failed: {e:#}"),
+                    ProbeOutcome::Err(e) => debug!(?family, "QAD probe failed: {e:#}"),
+                    ProbeOutcome::Timeout => debug!(?family, "QAD probe timed out"),
+                    ProbeOutcome::Cancelled => {}
                 }
                 self.publish();
                 self.advance();
@@ -719,17 +735,19 @@ impl NetReportActor {
                     self.publish();
                 }
             }
-            ProbeEvent::Https(result) => {
+            ProbeEvent::Https(run) => {
                 self.probe_finished();
-                match result {
-                    Ok(report) => {
+                match run {
+                    ProbeOutcome::Ok(report) => {
                         debug!(?report, "HTTPS probe completed");
                         self.report.apply_https_result(&report);
                         if self.have_all_relay_latencies() {
                             self.cancel_https.cancel();
                         }
                     }
-                    Err(e) => debug!("HTTPS probe failed: {e:#}"),
+                    ProbeOutcome::Err(e) => debug!("HTTPS probe failed: {e:#}"),
+                    ProbeOutcome::Timeout => debug!("HTTPS probe timed out"),
+                    ProbeOutcome::Cancelled => {}
                 }
                 self.publish();
                 self.advance();
@@ -765,7 +783,7 @@ impl NetReportActor {
         }
         if let Some(c) = &self.cycle
             && !c.published
-            && !c.determined.covers(c.expected)
+            && !c.qad.all_determined()
         {
             return;
         }
@@ -937,16 +955,8 @@ impl NetReportActor {
                     shutdown,
                     probe_events,
                 );
-                let result = match run_probe_task(&cancel, delay, QAD_PROBE_TIMEOUT, work).await {
-                    ProbeRun::Done(Ok(x)) => Ok(x),
-                    ProbeRun::Done(Err(e)) => Err(e),
-                    ProbeRun::TimedOut => Err(n0_error::e!(QadProbeError::Timeout)),
-                    ProbeRun::Cancelled => Err(n0_error::e!(QadProbeError::Cancelled)),
-                };
-                events
-                    .send(ProbeEvent::QadResult(family, result))
-                    .await
-                    .ok();
+                let run = run_probe_task(&cancel, delay, QAD_PROBE_TIMEOUT, work).await;
+                events.send(ProbeEvent::QadResult(family, run)).await.ok();
             }
             .instrument(span),
         );
@@ -988,13 +998,8 @@ impl NetReportActor {
                 #[cfg(not(wasm_browser))]
                 tls_config,
             );
-            let result = match run_probe_task(&cancel, delay, HTTPS_PROBE_TIMEOUT, work).await {
-                ProbeRun::Done(Ok(r)) => Ok(r),
-                ProbeRun::Done(Err(e)) => Err(n0_error::e!(HttpsProbeError::ProbeFailure, e)),
-                ProbeRun::TimedOut => Err(n0_error::e!(HttpsProbeError::Timeout)),
-                ProbeRun::Cancelled => Err(n0_error::e!(HttpsProbeError::Cancelled)),
-            };
-            events.send(ProbeEvent::Https(result)).await.ok();
+            let run = run_probe_task(&cancel, delay, HTTPS_PROBE_TIMEOUT, work).await;
+            events.send(ProbeEvent::Https(run)).await.ok();
         });
     }
 
@@ -1022,16 +1027,17 @@ impl NetReportActor {
                 match run_probe_task(&cancel, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, work)
                     .await
                 {
-                    ProbeRun::Done(Ok(found)) => Some(found),
-                    ProbeRun::Done(Err(e)) => {
+                    ProbeOutcome::Ok(found) => Some(found),
+                    ProbeOutcome::Err(e) => {
                         debug!("captive portal check failed: {e:#}");
                         None
                     }
-                    ProbeRun::TimedOut => {
+                    ProbeOutcome::Timeout => {
                         debug!("captive portal check timed out");
                         None
                     }
-                    ProbeRun::Cancelled => None,
+                    // Cancelled is expected: a successful QAD cancels this check.
+                    ProbeOutcome::Cancelled => None,
                 };
             events.send(ProbeEvent::CaptivePortal(found)).await.ok();
         });
@@ -1049,32 +1055,34 @@ mod tests {
     use crate::net_report::probes::Probe;
 
     #[test]
-    fn test_families_covers() {
-        let none = AddrFamilies::default();
-        let v4 = AddrFamilies {
-            v4: true,
-            v6: false,
-        };
-        let v6 = AddrFamilies {
-            v4: false,
-            v6: true,
-        };
-        let both = AddrFamilies { v4: true, v6: true };
+    fn test_qad_gate() {
+        // Nothing being probed: the gate never blocks.
+        assert!(QadState::default().all_determined());
 
-        // Nothing expected: always covered (the gate never blocks).
-        assert!(none.covers(none));
-        assert!(v4.covers(none));
+        // A probed family blocks until it is determined.
+        let mut qad = QadState::default();
+        qad.v4.probing = true;
+        assert!(!qad.all_determined());
+        qad.v4.determined = true;
+        assert!(qad.all_determined());
 
-        // A single expected family is covered only once seen.
-        assert!(v4.covers(v4));
-        assert!(!none.covers(v4));
-        assert!(!v6.covers(v4));
+        // Both probed: both must be determined.
+        let mut qad = QadState::default();
+        qad.v4.probing = true;
+        qad.v6.probing = true;
+        qad.v4.determined = true;
+        assert!(!qad.all_determined());
+        qad.v6.determined = true;
+        assert!(qad.all_determined());
 
-        // Both expected: need both seen.
-        assert!(both.covers(both));
-        assert!(!v4.covers(both));
-        assert!(!v6.covers(both));
-        assert!(both.covers(v4));
+        // A family that is not being probed does not block, even if another
+        // probed family has determined.
+        let mut qad = QadState::default();
+        qad.v6.probing = true;
+        qad.v4.determined = true;
+        assert!(!qad.all_determined());
+        qad.v6.determined = true;
+        assert!(qad.all_determined());
     }
 
     fn relay_url(i: u16) -> RelayUrl {

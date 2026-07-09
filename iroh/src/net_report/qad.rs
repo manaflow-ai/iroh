@@ -75,10 +75,6 @@ pub(super) enum QadProbeError {
     Quic { source: iroh_relay::quic::Error },
     #[error("Receiver dropped")]
     ReceiverDropped,
-    #[error("Probe timed out")]
-    Timeout,
-    #[error("Probe cancelled")]
-    Cancelled,
 }
 
 #[cfg(not(wasm_browser))]

@@ -21,18 +21,6 @@ use super::defaults::timeouts::DNS_TIMEOUT;
 use crate::address_lookup::DNS_STAGGERING_MS;
 use crate::util::reqwest_client_builder;
 
-#[allow(missing_docs)]
-#[stack_error(derive, add_meta)]
-#[non_exhaustive]
-pub(super) enum HttpsProbeError {
-    #[error("HTTPS probe failed")]
-    ProbeFailure { source: MeasureHttpsLatencyError },
-    #[error("Probe cancelled")]
-    Cancelled,
-    #[error("Probe timed out")]
-    Timeout,
-}
-
 #[derive(Debug, Clone)]
 pub(super) struct HttpsProbeReport {
     /// The relay that was probed.
