@@ -64,7 +64,7 @@ pub(super) enum MeasureHttpsLatencyError {
 /// native targets) so it follows the same path as relay client connections.
 #[allow(clippy::unused_async)]
 pub(super) async fn run_probe(
-    #[cfg(not(wasm_browser))] dns_resolver: &DnsResolver,
+    #[cfg(not(wasm_browser))] dns_resolver: DnsResolver,
     relay: RelayUrl,
     #[cfg(not(wasm_browser))] tls_config: rustls::ClientConfig,
 ) -> Result<HttpsProbeReport, MeasureHttpsLatencyError> {
@@ -147,7 +147,7 @@ mod tests {
         let dns_resolver = DnsResolver::new();
         tracing::info!(relay_url = ?relay.url , "RELAY_URL");
         let report = run_probe(
-            &dns_resolver,
+            dns_resolver,
             relay.url,
             CaTlsConfig::insecure_skip_verify()
                 .client_config(default_provider())

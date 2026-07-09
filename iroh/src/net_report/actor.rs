@@ -45,7 +45,7 @@ use n0_future::{
 use n0_watcher::Watchable;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, trace};
+use tracing::{Instrument, Span, debug, error, info_span, trace};
 
 #[cfg(not(wasm_browser))]
 use super::captive_portal::CaptivePortalError;
@@ -79,35 +79,17 @@ pub(super) enum ProbeOutcome<T, E> {
     Cancelled,
 }
 
-/// Runs a probe future under `cancel`, an optional leading `delay`, and a
-/// `timeout`.
-///
-/// The delay is applied before the timeout starts, so a staggered probe still
-/// gets the full timeout once it begins.
-async fn run_probe_task<T, E, F>(
-    cancel: &CancellationToken,
-    delay: Duration,
-    timeout: Duration,
-    work: F,
-) -> ProbeOutcome<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    let outcome = cancel
-        .run_until_cancelled(async move {
-            if !delay.is_zero() {
-                time::sleep(delay).await;
-            }
-            time::timeout(timeout, work).await
-        })
-        .await;
-    match outcome {
-        Some(Ok(Ok(value))) => ProbeOutcome::Ok(value),
-        Some(Ok(Err(err))) => ProbeOutcome::Err(err),
-        Some(Err(_elapsed)) => ProbeOutcome::Timeout,
-        None => ProbeOutcome::Cancelled,
-    }
-}
+/// `Send` on native targets, no bound in the browser, where tasks run on a
+/// single thread and browser futures are not `Send`. Lets a spawn helper be
+/// generic over both.
+#[cfg(not(wasm_browser))]
+trait MaybeSend: Send {}
+#[cfg(not(wasm_browser))]
+impl<T: Send + ?Sized> MaybeSend for T {}
+#[cfg(wasm_browser)]
+trait MaybeSend {}
+#[cfg(wasm_browser)]
+impl<T: ?Sized> MaybeSend for T {}
 
 /// A probe request waiting for the actor to pick it up.
 ///
@@ -953,29 +935,20 @@ impl NetReportActor {
         quic_client: iroh_relay::quic::QuicClient,
         delay: Duration,
     ) {
-        use tracing::{Instrument, info_span};
-
-        let dns_resolver = self.dns_resolver.clone();
-        let relay_url = relay.url.clone();
-        let shutdown = self.shutdown.child_token();
-        let cancel = self.qad_conns.cancel(family).child_token();
-        let events = self.events_tx.clone();
-        let probe_events = events.clone();
-        let span = info_span!("QAD", ?family, %relay_url);
-        self.tasks.spawn(
-            async move {
-                let work = super::qad::run_probe(
-                    family,
-                    relay,
-                    quic_client,
-                    dns_resolver,
-                    shutdown,
-                    probe_events,
-                );
-                let run = run_probe_task(&cancel, delay, QAD_PROBE_TIMEOUT, work).await;
-                events.send(ProbeEvent::QadResult(family, run)).await.ok();
-            }
-            .instrument(span),
+        self.spawn_probe_task(
+            info_span!("QAD", ?family, relay_url=%relay.url),
+            self.qad_conns.cancel(family).child_token(),
+            delay,
+            QAD_PROBE_TIMEOUT,
+            super::qad::run_probe(
+                family,
+                relay,
+                quic_client,
+                self.dns_resolver.clone(),
+                self.shutdown.child_token(),
+                self.events_tx.clone(),
+            ),
+            move |outcome| ProbeEvent::QadResult(family, outcome),
         );
     }
 
@@ -1001,49 +974,87 @@ impl NetReportActor {
     }
 
     fn spawn_https_probe(&mut self, delay: Duration, relay: Arc<iroh_relay::RelayConfig>) {
-        let cancel = self.cancel_https.child_token();
-        let events = self.events_tx.clone();
-        #[cfg(not(wasm_browser))]
-        let dns_resolver = self.dns_resolver.clone();
-        #[cfg(not(wasm_browser))]
-        let tls_config = self.tls_config.clone();
-        self.tasks.spawn(async move {
-            let work = super::https::run_probe(
+        self.spawn_probe_task(
+            info_span!("HTTPS", relay_url=%relay.url),
+            self.cancel_https.child_token(),
+            delay,
+            HTTPS_PROBE_TIMEOUT,
+            super::https::run_probe(
                 #[cfg(not(wasm_browser))]
-                &dns_resolver,
+                self.dns_resolver.clone(),
                 relay.url.clone(),
                 #[cfg(not(wasm_browser))]
-                tls_config,
-            );
-            let run = run_probe_task(&cancel, delay, HTTPS_PROBE_TIMEOUT, work).await;
-            events.send(ProbeEvent::Https(run)).await.ok();
-        });
+                self.tls_config.clone(),
+            ),
+            ProbeEvent::Https,
+        );
     }
 
     /// Spawns a captive portal detection check, delayed by
-    /// [`CAPTIVE_PORTAL_DELAY`] to give QAD probes time to succeed first,
-    /// and cancelled if QAD confirms UDP connectivity.
+    /// [`CAPTIVE_PORTAL_DELAY`] to give QAD probes time to succeed first, and
+    /// cancelled if QAD confirms UDP connectivity.
     #[cfg(not(wasm_browser))]
     fn spawn_captive_portal(&mut self) {
         self.cancel_captive_portal = CancellationToken::new();
-        let cancel = self.cancel_captive_portal.clone();
-        let dns = self.dns_resolver.clone();
-        let relay_map = self.relay_map.clone();
-        let tls = self.tls_config.clone();
         let preferred = self
             .reports
             .last
             .as_ref()
             .and_then(|r| r.preferred_relay.clone());
-        let events = self.events_tx.clone();
+        self.spawn_probe_task(
+            info_span!("captive-portal"),
+            self.cancel_captive_portal.child_token(),
+            CAPTIVE_PORTAL_DELAY,
+            CAPTIVE_PORTAL_TIMEOUT,
+            super::captive_portal::check(
+                self.dns_resolver.clone(),
+                self.relay_map.clone(),
+                preferred,
+                self.tls_config.clone(),
+            ),
+            ProbeEvent::CaptivePortal,
+        );
+    }
 
-        self.tasks.spawn(async move {
-            trace!("captive portal check scheduled");
-            let work = super::captive_portal::check(&dns, &relay_map, preferred, tls);
-            let run =
-                run_probe_task(&cancel, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, work).await;
-            events.send(ProbeEvent::CaptivePortal(run)).await.ok();
-        });
+    /// Spawns a probe task into the actor's [`JoinSet`].
+    ///
+    /// The task waits out `delay`, runs `work` with a `timeout`, and can be
+    /// aborted at any point through `cancel`. However the probe ends, the
+    /// result becomes a [`ProbeOutcome`]; `to_event` maps it into a
+    /// [`ProbeEvent`], which the task sends on the actor's channel. The delay
+    /// sits outside the timeout, so a staggered probe still gets its full
+    /// timeout once it starts.
+    fn spawn_probe_task<T: MaybeSend, E: MaybeSend>(
+        &mut self,
+        span: Span,
+        cancel: CancellationToken,
+        delay: Duration,
+        timeout: Duration,
+        work: impl 'static + MaybeSend + Future<Output = Result<T, E>>,
+        to_event: impl 'static + MaybeSend + FnOnce(ProbeOutcome<T, E>) -> ProbeEvent,
+    ) {
+        let events = self.events_tx.clone();
+        self.tasks.spawn(
+            async move {
+                let outcome = cancel
+                    .run_until_cancelled(async move {
+                        if !delay.is_zero() {
+                            time::sleep(delay).await;
+                        }
+                        time::timeout(timeout, work).await
+                    })
+                    .await;
+                let outcome = match outcome {
+                    Some(Ok(Ok(value))) => ProbeOutcome::Ok(value),
+                    Some(Ok(Err(err))) => ProbeOutcome::Err(err),
+                    Some(Err(_elapsed)) => ProbeOutcome::Timeout,
+                    None => ProbeOutcome::Cancelled,
+                };
+                let event = to_event(outcome);
+                events.send(event).await.ok();
+            }
+            .instrument(span),
+        );
     }
 }
 

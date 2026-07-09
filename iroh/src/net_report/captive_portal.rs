@@ -45,11 +45,12 @@ pub(super) enum CaptivePortalError {
 /// something other than the expected empty 204.
 #[cfg(not(wasm_browser))]
 pub(super) async fn check(
-    dns_resolver: &DnsResolver,
-    dm: &RelayMap,
+    dns_resolver: DnsResolver,
+    dm: RelayMap,
     preferred_relay: Option<RelayUrl>,
     tls_config: rustls::ClientConfig,
 ) -> Result<bool, CaptivePortalError> {
+    trace!("captive portal check starting");
     // If we have a preferred relay and we can use it for non-QAD requests, try that;
     // otherwise, pick a random one suitable for non-STUN requests.
 
