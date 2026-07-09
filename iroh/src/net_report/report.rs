@@ -73,6 +73,16 @@ impl Report {
         }
     }
 
+    /// Returns `true` if the report carries meaningful probe data.
+    ///
+    /// Used to avoid publishing an empty report over a previous one.
+    pub(super) fn has_data(&self) -> bool {
+        self.global_v4.is_some()
+            || self.global_v6.is_some()
+            || self.has_udp()
+            || !self.relay_latency.is_empty()
+    }
+
     /// Incorporates an HTTPS probe result into the report's relay latencies.
     pub(super) fn apply_https_result(&mut self, report: &HttpsProbeReport) {
         self.relay_latency

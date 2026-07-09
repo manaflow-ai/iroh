@@ -30,7 +30,7 @@
 //! even while probes are still running, and gives up on any stragglers after
 //! [`ABORT_TIMEOUT`].
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, future::Future, sync::Arc};
 
 use iroh_relay::RelayMap;
 #[cfg(not(wasm_browser))]
@@ -63,6 +63,40 @@ use super::{SharedContext, defaults::timeouts::QAD_PROBE_TIMEOUT};
 
 /// Capacity of the actor's event channel.
 const EVENT_CHANNEL_CAP: usize = 64;
+
+/// How a probe's inner future ended: it produced a value, timed out, or was
+/// cancelled.
+enum ProbeRun<T> {
+    Done(T),
+    TimedOut,
+    Cancelled,
+}
+
+/// Runs a probe future under `cancel`, an optional leading `delay`, and a
+/// `timeout`, normalizing the three ways it can end.
+///
+/// The delay is applied before the timeout starts, so a staggered probe still
+/// gets the full timeout once it begins.
+async fn run_probe_task<F: Future>(
+    cancel: &CancellationToken,
+    delay: Duration,
+    timeout: Duration,
+    work: F,
+) -> ProbeRun<F::Output> {
+    let outcome = cancel
+        .run_until_cancelled(async move {
+            if !delay.is_zero() {
+                time::sleep(delay).await;
+            }
+            time::timeout(timeout, work).await
+        })
+        .await;
+    match outcome {
+        Some(Ok(value)) => ProbeRun::Done(value),
+        Some(Err(_elapsed)) => ProbeRun::TimedOut,
+        None => ProbeRun::Cancelled,
+    }
+}
 
 /// A probe request waiting for the actor to pick it up.
 ///
@@ -307,6 +341,22 @@ impl ReportHistory {
         self.prev.insert(now, r.clone());
         self.last = Some(r.clone());
     }
+
+    /// Decides the scope of the next cycle.
+    ///
+    /// A `Full` request always yields a `Full` cycle. A `Refresh` request is
+    /// promoted to `Full` on the first cycle, once the full-report interval has
+    /// elapsed, or when the last report saw a captive portal without UDP.
+    fn scope_for(&self, request: ProbeScope, now: Instant) -> ProbeScope {
+        let full = request == ProbeScope::Full
+            || self.next_full
+            || now.duration_since(self.last_full) > FULL_REPORT_INTERVAL
+            || self
+                .last
+                .as_ref()
+                .is_some_and(|r| !r.has_udp() && r.captive_portal == Some(true));
+        ProbeScope::from_major(full)
+    }
 }
 
 /// State of the currently running probe cycle.
@@ -314,11 +364,19 @@ struct ProbeCycle {
     started: Instant,
     /// Probe tasks that have not yet reported a terminal result.
     pending: usize,
-    /// QAD families this cycle is probing. The first report is held until
-    /// each of these has produced a result (or [`FIRST_REPORT_TIMEOUT`] fires).
+    /// QAD families this cycle is probing. The first report is held until each
+    /// is determined (see `determined`) or [`FIRST_REPORT_TIMEOUT`] fires.
     expected: AddrFamilies,
-    /// QAD families that have produced a result so far.
-    seen: AddrFamilies,
+    /// QAD families that are determined: they have an address, or all of their
+    /// probes have finished (so the family is genuinely down).
+    determined: AddrFamilies,
+    /// QAD probes still outstanding per family. A family becomes determined on
+    /// its first success or once this reaches zero, so we never publish a
+    /// family-negative first report while a success may still arrive.
+    #[cfg(not(wasm_browser))]
+    qad_outstanding_v4: usize,
+    #[cfg(not(wasm_browser))]
+    qad_outstanding_v6: usize,
     /// Whether the first report of this cycle has been published yet.
     published: bool,
     /// A `Refresh` request that arrived mid-cycle, run when this one ends.
@@ -327,6 +385,17 @@ struct ProbeCycle {
     report_deadline: Option<Instant>,
     /// Fires at [`ABORT_TIMEOUT`]; `None` once fired.
     abort_deadline: Option<Instant>,
+}
+
+#[cfg(not(wasm_browser))]
+impl ProbeCycle {
+    /// The count of QAD probes still outstanding for `family`.
+    fn qad_outstanding(&mut self, family: AddrFamily) -> &mut usize {
+        match family {
+            AddrFamily::V4 => &mut self.qad_outstanding_v4,
+            AddrFamily::V6 => &mut self.qad_outstanding_v6,
+        }
+    }
 }
 
 /// Actor that owns all probe state and emits report updates via
@@ -524,17 +593,7 @@ impl NetReportActor {
             scope: request_scope,
         } = req;
         let now = Instant::now();
-        // A `Refresh` request is promoted to a `Full` cycle when a full
-        // re-probe is due.
-        let major = request_scope == ProbeScope::Full
-            || self.reports.next_full
-            || now.duration_since(self.reports.last_full) > FULL_REPORT_INTERVAL
-            || self
-                .reports
-                .last
-                .as_ref()
-                .is_some_and(|r| !r.has_udp() && r.captive_portal == Some(true));
-        let scope = ProbeScope::from_major(major);
+        let scope = self.reports.scope_for(request_scope, now);
 
         debug!(?request_scope, ?scope, "starting probe cycle");
 
@@ -554,10 +613,20 @@ impl NetReportActor {
         self.cancel_https = CancellationToken::new();
 
         #[cfg(not(wasm_browser))]
-        let (qad_pending, expected) = self.spawn_qad_probes(&if_state);
+        let (qad_v4, qad_v6) = self.spawn_qad_probes(&if_state);
         #[cfg(wasm_browser)]
-        let (qad_pending, expected) = (0usize, AddrFamilies::default());
-        let mut pending = qad_pending + self.spawn_https_probes();
+        let (qad_v4, qad_v6) = (0usize, 0usize);
+        let mut expected = AddrFamilies::default();
+        #[cfg(not(wasm_browser))]
+        {
+            if qad_v4 > 0 {
+                expected.set(AddrFamily::V4);
+            }
+            if qad_v6 > 0 {
+                expected.set(AddrFamily::V6);
+            }
+        }
+        let mut pending = qad_v4 + qad_v6 + self.spawn_https_probes();
         #[cfg(not(wasm_browser))]
         if scope == ProbeScope::Full && self.captive_portal_check {
             self.spawn_captive_portal();
@@ -568,7 +637,11 @@ impl NetReportActor {
             started: now,
             pending,
             expected,
-            seen: AddrFamilies::default(),
+            determined: AddrFamilies::default(),
+            #[cfg(not(wasm_browser))]
+            qad_outstanding_v4: qad_v4,
+            #[cfg(not(wasm_browser))]
+            qad_outstanding_v6: qad_v6,
             published: false,
             rerun: None,
             report_deadline: Some(now + FIRST_REPORT_TIMEOUT),
@@ -587,7 +660,17 @@ impl NetReportActor {
             #[cfg(not(wasm_browser))]
             ProbeEvent::QadResult(family, result) => {
                 if let Some(c) = &mut self.cycle {
-                    c.seen.set(family);
+                    let remaining = {
+                        let r = c.qad_outstanding(family);
+                        *r = r.saturating_sub(1);
+                        *r
+                    };
+                    // A family is determined once it has a result or all of
+                    // its probes are done, so a fast failure does not publish
+                    // a premature family-negative first report.
+                    if result.is_ok() || remaining == 0 {
+                        c.determined.set(family);
+                    }
                 }
                 self.probe_finished();
                 match result {
@@ -677,12 +760,12 @@ impl NetReportActor {
     /// caller does not briefly see an IPv4-only report just before the IPv6
     /// address arrives.
     fn publish(&mut self) {
-        if !has_data(&self.report) {
+        if !self.report.has_data() {
             return;
         }
         if let Some(c) = &self.cycle
             && !c.published
-            && !c.seen.covers(c.expected)
+            && !c.determined.covers(c.expected)
         {
             return;
         }
@@ -706,9 +789,12 @@ impl NetReportActor {
             return;
         };
         self.reports.record(&mut self.report);
+        // Emit the final report, now stamped with the preferred relay. This
+        // often repeats the last incremental value; `Watchable::set` only
+        // notifies watchers on change, so an identical final emit is a no-op.
         // Keep the last good report rather than overwriting it with an empty
         // one when a cycle discovered nothing.
-        if has_data(&self.report) {
+        if self.report.has_data() {
             self.report_out.set(Some(self.report.clone())).ok();
         }
         debug!(
@@ -758,16 +844,16 @@ impl NetReportActor {
         seen.len() >= num_relays
     }
 
-    /// Starts a QAD probe for each family that needs one, and returns how
-    /// many it started together with the set of families being probed.
+    /// Starts a QAD probe for each family that needs one, and returns how many
+    /// it started per family (v4, v6).
     ///
     /// A family needs a probe only when it has no open connection. Before
     /// deciding, any connection that has since closed is dropped, and the
     /// last address of each surviving connection is copied into the report.
     #[cfg(not(wasm_browser))]
-    fn spawn_qad_probes(&mut self, if_state: &IfState) -> (usize, AddrFamilies) {
+    fn spawn_qad_probes(&mut self, if_state: &IfState) -> (usize, usize) {
         let Some(quic_client) = self.context.quic_client.clone() else {
-            return (0, AddrFamilies::default());
+            return (0, 0);
         };
 
         // Drop any connection that has closed, then copy the last address of
@@ -797,15 +883,10 @@ impl NetReportActor {
             ),
         ];
 
-        let mut expected = AddrFamilies::default();
-        for (family, needed) in families {
-            if needed {
-                expected.set(family);
-            }
-        }
-
         const MAX_RELAYS: usize = 5;
-        let mut count = 0;
+        let mut spawned = 0;
+        let mut count_v4 = 0;
+        let mut count_v6 = 0;
         for relay in self
             .relay_map
             .relays::<Vec<_>>()
@@ -815,14 +896,18 @@ impl NetReportActor {
             for (family, needed) in families {
                 if needed {
                     // Stagger successive probes so they do not all fire at
-                    // once. The first probe (count == 0) starts immediately.
-                    let delay = self.qad_stagger * count as u32;
+                    // once. The first probe (spawned == 0) starts immediately.
+                    let delay = self.qad_stagger * spawned as u32;
                     self.spawn_qad_probe(family, relay.clone(), quic_client.clone(), delay);
-                    count += 1;
+                    spawned += 1;
+                    match family {
+                        AddrFamily::V4 => count_v4 += 1,
+                        AddrFamily::V6 => count_v6 += 1,
+                    }
                 }
             }
         }
-        (count, expected)
+        (count_v4, count_v6)
     }
 
     #[cfg(not(wasm_browser))]
@@ -844,32 +929,19 @@ impl NetReportActor {
         let span = info_span!("QAD", ?family, %relay_url);
         self.tasks.spawn(
             async move {
-                // The stagger delay is outside the timeout so each probe still
-                // gets the full QAD_PROBE_TIMEOUT once it starts.
-                let outcome = cancel
-                    .run_until_cancelled(async move {
-                        if !delay.is_zero() {
-                            time::sleep(delay).await;
-                        }
-                        time::timeout(
-                            QAD_PROBE_TIMEOUT,
-                            super::qad::run_probe(
-                                family,
-                                relay,
-                                quic_client,
-                                dns_resolver,
-                                shutdown,
-                                probe_events,
-                            ),
-                        )
-                        .await
-                    })
-                    .await;
-                let result = match outcome {
-                    Some(Ok(Ok(x))) => Ok(x),
-                    Some(Ok(Err(e))) => Err(e),
-                    Some(Err(_)) => Err(n0_error::e!(QadProbeError::Timeout)),
-                    None => Err(n0_error::e!(QadProbeError::Cancelled)),
+                let work = super::qad::run_probe(
+                    family,
+                    relay,
+                    quic_client,
+                    dns_resolver,
+                    shutdown,
+                    probe_events,
+                );
+                let result = match run_probe_task(&cancel, delay, QAD_PROBE_TIMEOUT, work).await {
+                    ProbeRun::Done(Ok(x)) => Ok(x),
+                    ProbeRun::Done(Err(e)) => Err(e),
+                    ProbeRun::TimedOut => Err(n0_error::e!(QadProbeError::Timeout)),
+                    ProbeRun::Cancelled => Err(n0_error::e!(QadProbeError::Cancelled)),
                 };
                 events
                     .send(ProbeEvent::QadResult(family, result))
@@ -909,26 +981,18 @@ impl NetReportActor {
         #[cfg(not(wasm_browser))]
         let tls_config = self.tls_config.clone();
         self.tasks.spawn(async move {
-            let outcome = cancel
-                .run_until_cancelled(time::timeout(HTTPS_PROBE_TIMEOUT, async move {
-                    if !delay.is_zero() {
-                        time::sleep(delay).await;
-                    }
-                    super::https::run_probe(
-                        #[cfg(not(wasm_browser))]
-                        &context.dns_resolver,
-                        relay.url.clone(),
-                        #[cfg(not(wasm_browser))]
-                        tls_config,
-                    )
-                    .await
-                }))
-                .await;
-            let result = match outcome {
-                Some(Ok(Ok(r))) => Ok(r),
-                Some(Ok(Err(e))) => Err(n0_error::e!(HttpsProbeError::ProbeFailure, e)),
-                Some(Err(_)) => Err(n0_error::e!(HttpsProbeError::Timeout)),
-                None => Err(n0_error::e!(HttpsProbeError::Cancelled)),
+            let work = super::https::run_probe(
+                #[cfg(not(wasm_browser))]
+                &context.dns_resolver,
+                relay.url.clone(),
+                #[cfg(not(wasm_browser))]
+                tls_config,
+            );
+            let result = match run_probe_task(&cancel, delay, HTTPS_PROBE_TIMEOUT, work).await {
+                ProbeRun::Done(Ok(r)) => Ok(r),
+                ProbeRun::Done(Err(e)) => Err(n0_error::e!(HttpsProbeError::ProbeFailure, e)),
+                ProbeRun::TimedOut => Err(n0_error::e!(HttpsProbeError::Timeout)),
+                ProbeRun::Cancelled => Err(n0_error::e!(HttpsProbeError::Cancelled)),
             };
             events.send(ProbeEvent::Https(result)).await.ok();
         });
@@ -953,39 +1017,25 @@ impl NetReportActor {
 
         self.tasks.spawn(async move {
             trace!("captive portal check scheduled");
-            let outcome = cancel
-                .run_until_cancelled(async move {
-                    time::sleep(CAPTIVE_PORTAL_DELAY).await;
-                    time::timeout(
-                        CAPTIVE_PORTAL_TIMEOUT,
-                        super::captive_portal::check(&dns, &relay_map, preferred, tls),
-                    )
+            let work = super::captive_portal::check(&dns, &relay_map, preferred, tls);
+            let found =
+                match run_probe_task(&cancel, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, work)
                     .await
-                })
-                .await;
-            let found = match outcome {
-                None => None,
-                Some(Ok(Ok(found))) => Some(found),
-                Some(Ok(Err(e))) => {
-                    debug!("captive portal check failed: {e:#}");
-                    None
-                }
-                Some(Err(_)) => {
-                    debug!("captive portal check timed out");
-                    None
-                }
-            };
+                {
+                    ProbeRun::Done(Ok(found)) => Some(found),
+                    ProbeRun::Done(Err(e)) => {
+                        debug!("captive portal check failed: {e:#}");
+                        None
+                    }
+                    ProbeRun::TimedOut => {
+                        debug!("captive portal check timed out");
+                        None
+                    }
+                    ProbeRun::Cancelled => None,
+                };
             events.send(ProbeEvent::CaptivePortal(found)).await.ok();
         });
     }
-}
-
-/// Returns `true` if the report carries meaningful probe data.
-fn has_data(report: &Report) -> bool {
-    report.global_v4.is_some()
-        || report.global_v6.is_some()
-        || report.has_udp()
-        || !report.relay_latency.is_empty()
 }
 
 #[cfg(all(test, with_crypto_provider))]
