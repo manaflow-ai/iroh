@@ -32,9 +32,11 @@
 
 use std::{collections::BTreeSet, future::Future, sync::Arc};
 
+#[cfg(not(wasm_browser))]
+use iroh_dns::dns::DnsResolver;
 use iroh_relay::RelayMap;
 #[cfg(not(wasm_browser))]
-use iroh_relay::quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON};
+use iroh_relay::quic::{QUIC_ADDR_DISC_CLOSE_CODE, QUIC_ADDR_DISC_CLOSE_REASON, QuicClient};
 use n0_future::{
     MaybeFuture,
     task::JoinSet,
@@ -46,9 +48,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, trace};
 
 #[cfg(not(wasm_browser))]
+use super::captive_portal::CaptivePortalError;
+#[cfg(not(wasm_browser))]
 use super::qad::{AddrFamily, QadConn, QadProbeError, QadProbeReport};
 use super::{
-    IfState, Report,
+    IfState, Options, Report,
     defaults::timeouts::{
         ABORT_TIMEOUT, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, FIRST_REPORT_TIMEOUT,
         FULL_REPORT_INTERVAL, HTTPS_PROBE_TIMEOUT,
@@ -59,7 +63,7 @@ use super::{
     report::RelayLatencies,
 };
 #[cfg(not(wasm_browser))]
-use super::{SharedContext, defaults::timeouts::QAD_PROBE_TIMEOUT};
+use super::{NetReportConfig, defaults::timeouts::QAD_PROBE_TIMEOUT};
 
 /// Capacity of the actor's event channel.
 const EVENT_CHANNEL_CAP: usize = 64;
@@ -190,9 +194,9 @@ pub(super) enum ProbeEvent {
     QadObservation(AddrFamily, QadProbeReport),
     /// An HTTPS latency probe finished.
     Https(ProbeOutcome<HttpsProbeReport, MeasureHttpsLatencyError>),
-    /// The captive portal check finished (`None` if cancelled or timed out).
+    /// The captive portal check finished.
     #[cfg(not(wasm_browser))]
-    CaptivePortal(Option<bool>),
+    CaptivePortal(ProbeOutcome<bool, CaptivePortalError>),
 }
 
 /// How much of the probe set a cycle runs.
@@ -446,19 +450,21 @@ pub(super) struct NetReportActor {
     metrics: Arc<Metrics>,
 
     relay_map: RelayMap,
+    /// QUIC client for QAD probes; `None` when QAD is disabled. Cloned into
+    /// each QAD probe task.
     #[cfg(not(wasm_browser))]
-    context: SharedContext,
+    quic_client: Option<QuicClient>,
+    /// DNS resolver, cloned into each probe task that resolves relay hosts.
+    #[cfg(not(wasm_browser))]
+    dns_resolver: DnsResolver,
     #[cfg(not(wasm_browser))]
     tls_config: rustls::ClientConfig,
     protocols: BTreeSet<Probe>,
-    /// Whether to run captive portal detection on full cycles.
+    /// User-facing configuration: whether to run captive portal detection, and
+    /// the QAD probe stagger delay. (`https_probes` is already resolved into
+    /// `protocols`.)
     #[cfg(not(wasm_browser))]
-    captive_portal_check: bool,
-    /// Delay added between successive QAD probes in a cycle. Zero fires them
-    /// all at once; a non-zero value spreads the burst out for constrained
-    /// devices (see [`NetReportConfig::qad_stagger`](super::NetReportConfig)).
-    #[cfg(not(wasm_browser))]
-    qad_stagger: Duration,
+    user_config: NetReportConfig,
 
     /// Owns every one-shot probe task so shutdown aborts them all. Results
     /// arrive through `events`, not `join_next`; this only reaps finished
@@ -488,34 +494,37 @@ pub(super) struct NetReportActor {
 }
 
 impl NetReportActor {
-    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         probe_requests: Arc<RequestSlot>,
         report_out: Watchable<Option<Report>>,
         relay_map: RelayMap,
-        #[cfg(not(wasm_browser))] context: SharedContext,
-        #[cfg(not(wasm_browser))] tls_config: rustls::ClientConfig,
-        protocols: BTreeSet<Probe>,
-        #[cfg(not(wasm_browser))] captive_portal_check: bool,
-        #[cfg(not(wasm_browser))] qad_stagger: Duration,
+        opts: Options,
+        #[cfg(not(wasm_browser))] dns_resolver: DnsResolver,
         shutdown: CancellationToken,
         metrics: Arc<Metrics>,
     ) -> Self {
+        let protocols = opts.as_protocols();
         let (events_tx, events) = mpsc::channel(EVENT_CHANNEL_CAP);
+
+        #[cfg(not(wasm_browser))]
+        let quic_client = opts
+            .quic_config
+            .map(|c| QuicClient::new(c.ep, c.client_config));
+
         Self {
             probe_requests,
             shutdown,
             metrics,
             relay_map,
             #[cfg(not(wasm_browser))]
-            context,
+            quic_client,
             #[cfg(not(wasm_browser))]
-            tls_config,
+            dns_resolver,
+            #[cfg(not(wasm_browser))]
+            tls_config: opts.tls_config,
             protocols,
             #[cfg(not(wasm_browser))]
-            captive_portal_check,
-            #[cfg(not(wasm_browser))]
-            qad_stagger,
+            user_config: opts.user_config,
             tasks: JoinSet::new(),
             events_tx,
             events,
@@ -657,7 +666,7 @@ impl NetReportActor {
         let qad = QadState::new(qad_v4, qad_v6);
         let mut pending = qad_v4 + qad_v6 + self.spawn_https_probes();
         #[cfg(not(wasm_browser))]
-        if scope == ProbeScope::Full && self.captive_portal_check {
+        if scope == ProbeScope::Full && self.user_config.captive_portal_check {
             self.spawn_captive_portal();
             pending += 1;
         }
@@ -753,10 +762,18 @@ impl NetReportActor {
                 self.advance();
             }
             #[cfg(not(wasm_browser))]
-            ProbeEvent::CaptivePortal(found) => {
+            ProbeEvent::CaptivePortal(run) => {
                 self.probe_finished();
-                debug!(?found, "captive portal check completed");
-                self.report.captive_portal = found;
+                match run {
+                    ProbeOutcome::Ok(found) => {
+                        debug!(found, "captive portal check completed");
+                        self.report.captive_portal = Some(found);
+                    }
+                    ProbeOutcome::Err(e) => debug!("captive portal check failed: {e:#}"),
+                    ProbeOutcome::Timeout => debug!("captive portal check timed out"),
+                    // Cancelled is expected: a successful QAD cancels this check.
+                    ProbeOutcome::Cancelled => {}
+                }
                 self.publish();
                 self.advance();
             }
@@ -870,7 +887,7 @@ impl NetReportActor {
     /// last address of each surviving connection is copied into the report.
     #[cfg(not(wasm_browser))]
     fn spawn_qad_probes(&mut self, if_state: &IfState) -> (usize, usize) {
-        let Some(quic_client) = self.context.quic_client.clone() else {
+        let Some(quic_client) = self.quic_client.clone() else {
             return (0, 0);
         };
 
@@ -915,7 +932,7 @@ impl NetReportActor {
                 if needed {
                     // Stagger successive probes so they do not all fire at
                     // once. The first probe (spawned == 0) starts immediately.
-                    let delay = self.qad_stagger * spawned as u32;
+                    let delay = self.user_config.qad_stagger * spawned as u32;
                     self.spawn_qad_probe(family, relay.clone(), quic_client.clone(), delay);
                     spawned += 1;
                     match family {
@@ -938,7 +955,7 @@ impl NetReportActor {
     ) {
         use tracing::{Instrument, info_span};
 
-        let dns_resolver = self.context.dns_resolver.clone();
+        let dns_resolver = self.dns_resolver.clone();
         let relay_url = relay.url.clone();
         let shutdown = self.shutdown.child_token();
         let cancel = self.qad_conns.cancel(family).child_token();
@@ -987,13 +1004,13 @@ impl NetReportActor {
         let cancel = self.cancel_https.child_token();
         let events = self.events_tx.clone();
         #[cfg(not(wasm_browser))]
-        let context = self.context.clone();
+        let dns_resolver = self.dns_resolver.clone();
         #[cfg(not(wasm_browser))]
         let tls_config = self.tls_config.clone();
         self.tasks.spawn(async move {
             let work = super::https::run_probe(
                 #[cfg(not(wasm_browser))]
-                &context.dns_resolver,
+                &dns_resolver,
                 relay.url.clone(),
                 #[cfg(not(wasm_browser))]
                 tls_config,
@@ -1010,7 +1027,7 @@ impl NetReportActor {
     fn spawn_captive_portal(&mut self) {
         self.cancel_captive_portal = CancellationToken::new();
         let cancel = self.cancel_captive_portal.clone();
-        let dns = self.context.dns_resolver.clone();
+        let dns = self.dns_resolver.clone();
         let relay_map = self.relay_map.clone();
         let tls = self.tls_config.clone();
         let preferred = self
@@ -1023,23 +1040,9 @@ impl NetReportActor {
         self.tasks.spawn(async move {
             trace!("captive portal check scheduled");
             let work = super::captive_portal::check(&dns, &relay_map, preferred, tls);
-            let found =
-                match run_probe_task(&cancel, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, work)
-                    .await
-                {
-                    ProbeOutcome::Ok(found) => Some(found),
-                    ProbeOutcome::Err(e) => {
-                        debug!("captive portal check failed: {e:#}");
-                        None
-                    }
-                    ProbeOutcome::Timeout => {
-                        debug!("captive portal check timed out");
-                        None
-                    }
-                    // Cancelled is expected: a successful QAD cancels this check.
-                    ProbeOutcome::Cancelled => None,
-                };
-            events.send(ProbeEvent::CaptivePortal(found)).await.ok();
+            let run =
+                run_probe_task(&cancel, CAPTIVE_PORTAL_DELAY, CAPTIVE_PORTAL_TIMEOUT, work).await;
+            events.send(ProbeEvent::CaptivePortal(run)).await.ok();
         });
     }
 }

@@ -12,8 +12,6 @@ use std::{sync::Arc, time::Duration};
 #[cfg(not(wasm_browser))]
 use iroh_dns::dns::DnsResolver;
 use iroh_relay::RelayMap;
-#[cfg(not(wasm_browser))]
-use iroh_relay::quic::QuicClient;
 use n0_future::task::AbortOnDropHandle;
 use n0_watcher::Watchable;
 use tokio_util::sync::CancellationToken;
@@ -53,18 +51,6 @@ impl From<netwatch::netmon::State> for IfState {
             have_v6: value.have_v6,
         }
     }
-}
-
-/// Shared dependencies handed to probe tasks: DNS resolution and QUIC
-/// connectivity.
-///
-/// The actor clones this into each probe task that needs them.
-#[cfg(not(wasm_browser))]
-#[derive(Debug, Clone)]
-pub(super) struct SharedContext {
-    /// `None` when QAD is disabled.
-    pub(super) quic_client: Option<QuicClient>,
-    pub(super) dns_resolver: DnsResolver,
 }
 
 /// Configuration for the net report component.
@@ -173,34 +159,15 @@ impl Client {
         shutdown: CancellationToken,
         report_out: Watchable<Option<Report>>,
     ) -> Self {
-        let protocols = opts.as_protocols();
-
-        #[cfg(not(wasm_browser))]
-        let quic_client = opts
-            .quic_config
-            .map(|c| iroh_relay::quic::QuicClient::new(c.ep, c.client_config));
-
-        #[cfg(not(wasm_browser))]
-        let context = SharedContext {
-            quic_client,
-            dns_resolver,
-        };
-
         let probe_requests = Arc::new(RequestSlot::new());
 
         let actor = NetReportActor::new(
             Arc::clone(&probe_requests),
             report_out,
             relay_map,
+            opts,
             #[cfg(not(wasm_browser))]
-            context,
-            #[cfg(not(wasm_browser))]
-            opts.tls_config,
-            protocols,
-            #[cfg(not(wasm_browser))]
-            opts.user_config.captive_portal_check,
-            #[cfg(not(wasm_browser))]
-            opts.user_config.qad_stagger,
+            dns_resolver,
             shutdown,
             metrics,
         );
