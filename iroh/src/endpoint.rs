@@ -2052,9 +2052,11 @@ mod tests {
             ConnectWithOptsError, Connection, ConnectionError, PathEvent, PathEventStream, presets,
         },
         protocol::{AcceptError, ProtocolHandler, Router},
+        socket::mapped_addrs::{EndpointIdMappedAddr, MappedAddr},
         test_utils::{
             QlogFileGroup, run_relay_server, run_relay_server_with, run_relay_server_with_access,
         },
+        tls,
     };
 
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
@@ -2816,6 +2818,104 @@ mod tests {
 
         client.close().await;
         server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_scopes_explicit_bootstrap_paths_to_each_dial() -> Result {
+        const ALPN_A: &[u8] = b"n0/iroh/bootstrap-attempt-a";
+        const ALPN_B: &[u8] = b"n0/iroh/bootstrap-attempt-b";
+
+        let server_secret = SecretKey::from_bytes(&[42; 32]);
+        let server_id = server_secret.public();
+        let make_server = || {
+            Endpoint::builder(presets::Minimal)
+                .secret_key(server_secret.clone())
+                .alpns(vec![ALPN_A.to_vec(), ALPN_B.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        };
+        let server_a = make_server()?.bind().await?;
+        let server_b = make_server()?.bind().await?;
+        let server_a_addr = *server_a
+            .addr()
+            .ip_addrs()
+            .next()
+            .expect("server A must publish its explicit loopback address");
+        let server_b_addr = *server_b
+            .addr()
+            .ip_addrs()
+            .next()
+            .expect("server B must publish its explicit loopback address");
+        assert_ne!(server_a_addr, server_b_addr);
+
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let inner = client.inner()?;
+
+        // Resolve both dials before starting either QUIC connection. They target the same
+        // authenticated EndpointId but carry disjoint, caller-supplied bootstrap addresses.
+        // The two returned mapped addresses pause and identify the attempts until Noq sends
+        // their Initials below.
+        let mapped_a = inner
+            .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_a_addr))
+            .await
+            .anyerr()??;
+        let mapped_b = inner
+            .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_b_addr))
+            .await
+            .anyerr()??;
+
+        let start_dial = |mapped_addr: EndpointIdMappedAddr, alpn: &[u8]| {
+            let transport_config = inner
+                .static_config
+                .transport_config
+                .clone()
+                .with_deferred_nat_traversal(true)
+                .to_inner_arc();
+            let client_config = inner
+                .static_config
+                .create_client_config(vec![alpn.to_vec()], transport_config);
+            inner.noq_endpoint().connect_with(
+                client_config,
+                mapped_addr.private_socket_addr(),
+                &tls::name::encode(server_id),
+            )
+        };
+        let dial_a = start_dial(mapped_a, ALPN_A).anyerr()?;
+        let dial_b = start_dial(mapped_b, ALPN_B).anyerr()?;
+
+        let (server_conn_a, server_conn_b, _client_conn_a, _client_conn_b) =
+            time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    async { server_a.accept().await.anyerr()?.await.anyerr() },
+                    async { server_b.accept().await.anyerr()?.await.anyerr() },
+                    async { dial_a.await.anyerr() },
+                    async { dial_b.await.anyerr() },
+                )
+            })
+            .await
+            .anyerr()??;
+
+        assert_eq!(
+            server_conn_a.alpn(),
+            ALPN_A,
+            "destination A received another dial's QUIC Initial"
+        );
+        assert_eq!(
+            server_conn_b.alpn(),
+            ALPN_B,
+            "destination B received another dial's QUIC Initial"
+        );
+
+        client.close().await;
+        server_a.close().await;
+        server_b.close().await;
         Ok(())
     }
 
