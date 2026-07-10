@@ -1528,3 +1528,42 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
         Some(s) => Some(s.next().await),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::VecDeque, net::SocketAddr};
+
+    use super::{MAX_PENDING_OPEN_PATHS, enqueue_pending_open_path};
+    use crate::socket::transports::FourTuple;
+
+    fn ip_path(port: u16) -> FourTuple {
+        FourTuple::Ip {
+            remote: SocketAddr::from(([192, 0, 2, 1], port)),
+            local: None,
+        }
+    }
+
+    #[test]
+    fn pending_open_paths_are_bounded_across_multi_connection_retries() {
+        let repeated_path = ip_path(1);
+        let mut pending = VecDeque::new();
+
+        // Each retry is fanned out to every connection. Two capped
+        // connections must not double the queue on every retry cycle.
+        for _ in 0..1_024 {
+            for _connection in 0..2 {
+                enqueue_pending_open_path(&mut pending, repeated_path.clone());
+            }
+        }
+        assert_eq!(pending, VecDeque::from([repeated_path]));
+
+        // A peer can advertise many distinct unreachable candidates. Retain
+        // only a fixed working set and prefer newer observations when full.
+        for port in 2..=(MAX_PENDING_OPEN_PATHS as u16 + 10) {
+            enqueue_pending_open_path(&mut pending, ip_path(port));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
+        assert!(!pending.contains(&ip_path(1)));
+        assert!(pending.contains(&ip_path(MAX_PENDING_OPEN_PATHS as u16 + 10)));
+    }
+}
