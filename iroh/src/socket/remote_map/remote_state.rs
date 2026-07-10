@@ -53,6 +53,25 @@ const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 /// The latency at or under which we don't try to upgrade to a better path.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 
+/// Maximum number of distinct paths waiting for a path-open retry.
+///
+/// A failed retry is attempted on every connection to the remote. Bounding and
+/// deduplicating this queue prevents that fan-out from growing it indefinitely.
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+fn enqueue_pending_open_path(
+    queue: &mut VecDeque<transports::FourTuple>,
+    addr: transports::FourTuple,
+) {
+    if queue.contains(&addr) {
+        return;
+    }
+    if queue.len() >= MAX_PENDING_OPEN_PATHS {
+        queue.pop_front();
+    }
+    queue.push_back(addr);
+}
+
 // TODO: use this
 // /// How long since the last activity we try to keep an established endpoint peering alive.
 // ///
@@ -1059,7 +1078,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        enqueue_pending_open_path(&mut self.pending_open_paths, open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
