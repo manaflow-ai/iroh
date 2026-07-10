@@ -59,17 +59,35 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// deduplicating this queue prevents that fan-out from growing it indefinitely.
 const MAX_PENDING_OPEN_PATHS: usize = 64;
 
-fn enqueue_pending_open_path(
-    queue: &mut VecDeque<transports::FourTuple>,
-    addr: transports::FourTuple,
-) {
-    if queue.contains(&addr) {
-        return;
+#[derive(Default)]
+struct PendingOpenPaths {
+    entries: VecDeque<transports::FourTuple>,
+}
+
+impl PendingOpenPaths {
+    fn enqueue(&mut self, addr: transports::FourTuple) {
+        if self.entries.contains(&addr) {
+            return;
+        }
+        if self.entries.len() >= MAX_PENDING_OPEN_PATHS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(addr);
     }
-    if queue.len() >= MAX_PENDING_OPEN_PATHS {
-        queue.pop_front();
+
+    fn pop_front(&mut self) -> Option<transports::FourTuple> {
+        self.entries.pop_front()
     }
-    queue.push_back(addr);
+
+    #[cfg(test)]
+    fn contains(&self, addr: &transports::FourTuple) -> bool {
+        self.entries.contains(addr)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 // TODO: use this
@@ -178,7 +196,7 @@ struct State {
     /// Paths which we still need to open.
     ///
     /// They failed to open because we did not have enough CIDs issued by the remote.
-    pending_open_paths: VecDeque<transports::FourTuple>,
+    pending_open_paths: PendingOpenPaths,
 
     // Internal state - address lookup
     //
@@ -217,7 +235,7 @@ impl RemoteStateActor {
                 selected_path: Default::default(),
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
-                pending_open_paths: VecDeque::new(),
+                pending_open_paths: PendingOpenPaths::default(),
                 address_lookup_stream: None,
                 path_selector,
             },
@@ -1078,7 +1096,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        enqueue_pending_open_path(&mut self.pending_open_paths, open_addr.clone());
+                        self.pending_open_paths.enqueue(open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1550,9 +1568,9 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, net::SocketAddr};
+    use std::net::SocketAddr;
 
-    use super::{MAX_PENDING_OPEN_PATHS, enqueue_pending_open_path};
+    use super::{MAX_PENDING_OPEN_PATHS, PendingOpenPaths};
     use crate::socket::transports::FourTuple;
 
     fn ip_path(port: u16) -> FourTuple {
@@ -1565,21 +1583,22 @@ mod tests {
     #[test]
     fn pending_open_paths_are_bounded_across_multi_connection_retries() {
         let repeated_path = ip_path(1);
-        let mut pending = VecDeque::new();
+        let mut pending = PendingOpenPaths::default();
 
         // Each retry is fanned out to every connection. Two capped
         // connections must not double the queue on every retry cycle.
         for _ in 0..1_024 {
             for _connection in 0..2 {
-                enqueue_pending_open_path(&mut pending, repeated_path.clone());
+                pending.enqueue(repeated_path.clone());
             }
         }
-        assert_eq!(pending, VecDeque::from([repeated_path]));
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&repeated_path));
 
         // A peer can advertise many distinct unreachable candidates. Retain
         // only a fixed working set and prefer newer observations when full.
         for port in 2..=(MAX_PENDING_OPEN_PATHS as u16 + 10) {
-            enqueue_pending_open_path(&mut pending, ip_path(port));
+            pending.enqueue(ip_path(port));
         }
         assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
         assert!(!pending.contains(&ip_path(1)));
