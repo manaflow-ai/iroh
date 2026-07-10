@@ -1323,9 +1323,11 @@ impl EndpointInner {
     ) -> Result<Result<EndpointIdMappedAddr, AddressLookupFailed>, RemoteStateActorStoppedError>
     {
         let (tx, rx) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
         let remote_id = addr.id;
         self.actor_sender
-            .send(ActorMessage::ResolveRemote(addr, tx))
+            .send(ActorMessage::ResolveRemote(addr, tx, cancellation))
             .await
             .ok();
         let reply = rx.await.map_err(|_| RemoteStateActorStoppedError::new())?;
@@ -1383,6 +1385,7 @@ enum ActorMessage {
     ResolveRemote(
         EndpointAddr,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
+        CancellationToken,
     ),
     #[debug("AddConnection(..)")]
     AddConnection(
@@ -1781,8 +1784,8 @@ impl Actor {
             ActorMessage::RelayMapChange => {
                 self.handle_relay_map_change();
             }
-            ActorMessage::ResolveRemote(addr, tx) => {
-                self.remote_map.resolve_remote(addr, tx).await;
+            ActorMessage::ResolveRemote(addr, tx, cancellation) => {
+                self.remote_map.resolve_remote(addr, tx, cancellation).await;
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;

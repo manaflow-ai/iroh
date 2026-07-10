@@ -264,10 +264,14 @@ impl RemoteMap {
         &mut self,
         addr: EndpointAddr,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
     ) {
         let EndpointAddr { id, addrs } = addr;
-        self.send_to_actor(id, RemoteStateMessage::ResolveRemote(addrs, tx))
-            .await
+        self.send_to_actor(
+            id,
+            RemoteStateMessage::ResolveRemote(addrs, tx, cancellation),
+        )
+        .await
     }
 
     pub(super) async fn add_connection(
@@ -427,7 +431,9 @@ mod tests {
 
         // 1. Spawn A1 and let it process a real `ResolveRemote`.
         let (tx1, rx1) = oneshot::channel();
-        remote_map.resolve_remote(addr_with_ip(1234), tx1).await;
+        remote_map
+            .resolve_remote(addr_with_ip(1234), tx1, CancellationToken::new())
+            .await;
         assert!(
             matches!(rx1.await, Ok(Ok(()))),
             "First resolve completes Ok"
@@ -447,7 +453,9 @@ mod tests {
         //    We also resume time here so that we don't immediately idle-out again.
         tokio::time::resume();
         let (tx2, rx2) = oneshot::channel();
-        remote_map.resolve_remote(addr_with_ip(5678), tx2).await;
+        remote_map
+            .resolve_remote(addr_with_ip(5678), tx2, CancellationToken::new())
+            .await;
 
         // 4. Drive `cleanup`, like the socket actor does.
         //    Before our fixes, this would remove the sender to the just-started A2 from the sender map.
@@ -458,7 +466,9 @@ mod tests {
         //    the fix this would start a new actor because A2 was falsely removed from
         //    the senders map.
         let (tx3, rx3) = oneshot::channel();
-        remote_map.resolve_remote(EndpointAddr::new(eid), tx3).await;
+        remote_map
+            .resolve_remote(EndpointAddr::new(eid), tx3, CancellationToken::new())
+            .await;
 
         let outcome2 = rx2.await.expect("the resolve tx must be sent");
         let outcome3 = rx3.await.expect("the resolve tx must be sent");
