@@ -146,6 +146,15 @@ impl QuicTransportConfig {
     pub(crate) fn to_inner_arc(&self) -> Arc<noq::TransportConfig> {
         self.0.clone()
     }
+
+    pub(crate) fn with_deferred_nat_traversal(&self, defer: bool) -> Self {
+        if !defer {
+            return self.clone();
+        }
+        let mut inner = self.0.as_ref().clone();
+        inner.defer_nat_traversal_until_authorized(true);
+        Self(Arc::new(inner))
+    }
 }
 
 impl QuicTransportConfigBuilder {
@@ -602,18 +611,32 @@ pub struct ServerConfigBuilder {
 // Note: used in `iroh::endpoint::connection::Incoming::accept_with`
 // This is new-typed since `noq::ServerConfig` takes a `TransportConfig`, which we new-type as a `QuicTransportConfig`
 #[derive(Debug, Clone)]
-pub struct ServerConfig(Arc<noq::ServerConfig>);
+pub struct ServerConfig {
+    inner: Arc<noq::ServerConfig>,
+    transport: QuicTransportConfig,
+}
 
 impl ServerConfig {
-    pub(crate) fn to_inner_arc(&self) -> Arc<noq::ServerConfig> {
-        self.0.clone()
+    pub(crate) fn to_inner_arc(&self, defer_nat_traversal: bool) -> Arc<noq::ServerConfig> {
+        if !defer_nat_traversal {
+            return self.inner.clone();
+        }
+        let mut inner = self.inner.as_ref().clone();
+        let transport = self
+            .transport
+            .with_deferred_nat_traversal(defer_nat_traversal);
+        inner.transport_config(transport.to_inner_arc());
+        Arc::new(inner)
     }
 }
 
 impl ServerConfigBuilder {
     /// Build a [`ServerConfig`] from a [`ServerConfigBuilder`].
     pub fn build(self) -> ServerConfig {
-        ServerConfig(Arc::new(self.inner))
+        ServerConfig {
+            inner: Arc::new(self.inner),
+            transport: self.transport,
+        }
     }
 
     pub(crate) fn new(inner: noq::ServerConfig, transport: QuicTransportConfig) -> Self {

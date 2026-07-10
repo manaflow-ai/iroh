@@ -97,8 +97,9 @@ pub use self::{
     connection::{
         Accept, Accepting, AlpnError, AuthenticationError, Connecting, ConnectingError, Connection,
         ConnectionState, HandshakeCompleted, Incoming, IncomingAddr, IncomingZeroRtt,
-        IncomingZeroRttConnection, OutgoingZeroRtt, OutgoingZeroRttConnection,
-        RemoteEndpointIdError, RetryError, WeakConnectionHandle, ZeroRttStatus,
+        IncomingZeroRttConnection, NatTraversalAuthorizationError, OutgoingZeroRtt,
+        OutgoingZeroRttConnection, RemoteEndpointIdError, RetryError, WeakConnectionHandle,
+        ZeroRttStatus,
     },
     quic::{
         AcceptBi, AcceptUni, AckFrequencyConfig, ApplicationClose, Chunk, Closed, ClosedStream,
@@ -130,6 +131,7 @@ pub struct Builder {
     secret_key: Option<SecretKey>,
     alpn_protocols: Vec<Vec<u8>>,
     transport_config: QuicTransportConfig,
+    defer_nat_traversal_until_authorized: bool,
     keylog: bool,
     address_lookup: Vec<Box<dyn DynAddressLookupBuilder>>,
     address_lookup_user_data: Option<UserData>,
@@ -200,6 +202,7 @@ impl Builder {
             secret_key: Default::default(),
             alpn_protocols: Default::default(),
             transport_config: QuicTransportConfig::default(),
+            defer_nat_traversal_until_authorized: false,
             keylog: Default::default(),
             address_lookup: Default::default(),
             address_lookup_user_data: Default::default(),
@@ -242,11 +245,15 @@ impl Builder {
             self.max_tls_tickets,
             crypto_provider.clone(),
         );
+        let transport_config = self
+            .transport_config
+            .with_deferred_nat_traversal(self.defer_nat_traversal_until_authorized);
         let static_config = StaticConfig {
             server_config: tls_config.make_server_config(self.keylog)?,
             client_config: tls_config.make_client_config(self.keylog)?,
             tls_config,
-            transport_config: self.transport_config.clone(),
+            transport_config,
+            defer_nat_traversal_until_authorized: self.defer_nat_traversal_until_authorized,
             token_key,
             token_store: Arc::new(noq::TokenMemoryCache::default()),
         };
@@ -668,6 +675,19 @@ impl Builder {
     /// and maintaining direct connections.
     pub fn transport_config(mut self, transport_config: QuicTransportConfig) -> Self {
         self.transport_config = transport_config;
+        self
+    }
+
+    /// Defers NAT traversal for every connection until the application authorizes it.
+    ///
+    /// When enabled, a connection may establish over a relay or an explicitly supplied
+    /// direct address, but the endpoint does not advertise local candidates, react to
+    /// remote candidates, probe, or migrate to another direct path until
+    /// [`Connection::authorize_nat_traversal`] succeeds for that exact connection.
+    ///
+    /// This is disabled by default.
+    pub fn defer_nat_traversal_until_authorized(mut self, defer: bool) -> Self {
+        self.defer_nat_traversal_until_authorized = defer;
         self
     }
 
@@ -1131,8 +1151,13 @@ impl Endpoint {
 
         let transport_config = options
             .transport_config
-            .map(|cfg| cfg.to_inner_arc())
-            .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
+            .unwrap_or_else(|| self.inner.static_config.transport_config.clone())
+            .with_deferred_nat_traversal(
+                self.inner
+                    .static_config
+                    .defer_nat_traversal_until_authorized,
+            )
+            .to_inner_arc();
 
         // Start connecting via noq. This will time out after 10 seconds if no reachable
         // address is available.
@@ -2552,6 +2577,23 @@ mod tests {
         Ok(())
     }
 
+    async fn exchange_final_admission_ack(client: &Connection, server: &Connection) -> Result {
+        let send = async {
+            let mut send = client.open_uni().await.anyerr()?;
+            send.write_all(b"admission-ack").await.anyerr()?;
+            send.finish().anyerr()?;
+            Ok::<_, Error>(())
+        };
+        let receive = async {
+            let mut recv = server.accept_uni().await.anyerr()?;
+            let ack = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(ack, b"admission-ack");
+            Ok::<_, Error>(())
+        };
+        tokio::try_join!(send, receive)?;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn deferred_nat_traversal_waits_for_exact_connection_authorization() -> Result {
@@ -2569,7 +2611,7 @@ mod tests {
             .defer_nat_traversal_until_authorized(true)
             .bind()
             .await?;
-        tokio::try_join!(server.online(), client.online()).anyerr()?;
+        tokio::join!(server.online(), client.online());
 
         let server_id = server.id();
         let client_id = client.id();
@@ -2587,6 +2629,11 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_relay_only(&client_conn);
         assert_relay_only(&server_conn);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(client.metrics().socket.holepunch_attempts.get(), 0);
+            assert_eq!(server.metrics().socket.holepunch_attempts.get(), 0);
+        }
 
         let churn_addr: SocketAddr = "198.51.100.10:4242".parse().expect("valid test address");
         client.add_external_addr(churn_addr).await;
@@ -2595,11 +2642,38 @@ mod tests {
         assert_relay_only(&client_conn);
         assert_relay_only(&server_conn);
 
+        client_conn.authorize_nat_traversal().await?;
+        exchange_final_admission_ack(&client_conn, &server_conn).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
         server_conn.authorize_nat_traversal().await?;
+        wait_for_direct(&client_conn)
+            .await
+            .std_context("client did not migrate after authorization")?;
+        wait_for_direct(&server_conn)
+            .await
+            .std_context("server did not migrate after authorization")?;
+        #[cfg(feature = "metrics")]
+        assert!(client.metrics().socket.holepunch_attempts.get() > 0);
+
+        #[cfg(feature = "metrics")]
+        let attempts_before_idempotent_call = (
+            client.metrics().socket.holepunch_attempts.get(),
+            server.metrics().socket.holepunch_attempts.get(),
+        );
         client_conn.authorize_nat_traversal().await?;
         server_conn.authorize_nat_traversal().await?;
-        client_conn.authorize_nat_traversal().await?;
-        tokio::try_join!(wait_for_direct(&client_conn), wait_for_direct(&server_conn))?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            attempts_before_idempotent_call,
+            (
+                client.metrics().socket.holepunch_attempts.get(),
+                server.metrics().socket.holepunch_attempts.get(),
+            ),
+            "idempotent authorization started another NAT traversal round"
+        );
 
         assert_eq!(
             client.id(),
@@ -2617,7 +2691,12 @@ mod tests {
         let churn_addr: SocketAddr = "198.51.100.11:4243".parse().expect("valid test address");
         server.add_external_addr(churn_addr).await;
         assert!(server.remove_external_addr(&churn_addr).await);
-        tokio::try_join!(wait_for_direct(&client_conn), wait_for_direct(&server_conn))?;
+        wait_for_direct(&client_conn)
+            .await
+            .std_context("client lost its direct path after candidate churn")?;
+        wait_for_direct(&server_conn)
+            .await
+            .std_context("server lost its direct path after candidate churn")?;
 
         client.close().await;
         server.close().await;
@@ -2641,7 +2720,7 @@ mod tests {
             .defer_nat_traversal_until_authorized(true)
             .bind()
             .await?;
-        tokio::try_join!(server.online(), client.online()).anyerr()?;
+        tokio::join!(server.online(), client.online());
         let relay_addr = EndpointAddr::new(server.id()).with_relay_url(relay_url);
 
         let accept_first = tokio::spawn({
@@ -2650,12 +2729,15 @@ mod tests {
         });
         let first_client = client.connect(relay_addr.clone(), TEST_ALPN).await?;
         let first_server = accept_first.await.anyerr()??;
-        first_server.authorize_nat_traversal().await?;
         first_client.authorize_nat_traversal().await?;
-        tokio::try_join!(
-            wait_for_direct(&first_client),
-            wait_for_direct(&first_server)
-        )?;
+        exchange_final_admission_ack(&first_client, &first_server).await?;
+        first_server.authorize_nat_traversal().await?;
+        wait_for_direct(&first_client)
+            .await
+            .std_context("first client connection did not migrate")?;
+        wait_for_direct(&first_server)
+            .await
+            .std_context("first server connection did not migrate")?;
 
         let accept_second = tokio::spawn({
             let server = server.clone();
@@ -2672,8 +2754,8 @@ mod tests {
 
         // Re-authorizing the first connection and changing candidates must not
         // authorize another connection to the same EndpointId.
-        first_server.authorize_nat_traversal().await?;
         first_client.authorize_nat_traversal().await?;
+        first_server.authorize_nat_traversal().await?;
         let churn_addr: SocketAddr = "198.51.100.12:4244".parse().expect("valid test address");
         client.add_external_addr(churn_addr).await;
         assert!(client.remove_external_addr(&churn_addr).await);
@@ -2681,12 +2763,18 @@ mod tests {
         assert_relay_only(&second_client);
         assert_relay_only(&second_server);
 
-        second_server.authorize_nat_traversal().await?;
         second_client.authorize_nat_traversal().await?;
-        tokio::try_join!(
-            wait_for_direct(&second_client),
-            wait_for_direct(&second_server)
-        )?;
+        exchange_final_admission_ack(&second_client, &second_server).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+        second_server.authorize_nat_traversal().await?;
+        wait_for_direct(&second_client)
+            .await
+            .std_context("second client connection did not migrate")?;
+        wait_for_direct(&second_server)
+            .await
+            .std_context("second server connection did not migrate")?;
 
         client.close().await;
         server.close().await;
@@ -2719,6 +2807,12 @@ mod tests {
         exchange_pre_admission_control_stream(&client_conn, &server_conn).await?;
         assert!(client_conn.paths().iter().any(|path| path.is_ip()));
         assert!(server_conn.paths().iter().any(|path| path.is_ip()));
+
+        client_conn.close(0u32.into(), b"test complete");
+        assert!(
+            client_conn.authorize_nat_traversal().await.is_err(),
+            "a closed connection must fail NAT traversal authorization"
+        );
 
         client.close().await;
         server.close().await;

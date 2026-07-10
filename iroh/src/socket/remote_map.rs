@@ -147,6 +147,8 @@ struct Tasks {
     poll_cleanup_waker: Option<Waker>,
     /// The path selector used by all [`RemoteStateActor`]s spawned by this map.
     path_selector: Arc<dyn PathSelector>,
+    /// Whether new connections require application authorization before NAT traversal.
+    defer_nat_traversal_until_authorized: bool,
     /// The tracing span for this endpoint, to be used as parent span for `RemoteStateActor` tasks.
     span: Span,
 }
@@ -159,6 +161,7 @@ impl RemoteMap {
         address_lookup: address_lookup::AddressLookupServices,
         shutdown_token: CancellationToken,
         path_selector: Arc<dyn PathSelector>,
+        defer_nat_traversal_until_authorized: bool,
         span: Span,
     ) -> Self {
         Self {
@@ -172,6 +175,7 @@ impl RemoteMap {
                 tasks: Default::default(),
                 poll_cleanup_waker: None,
                 path_selector,
+                defer_nat_traversal_until_authorized,
                 span,
             },
         }
@@ -284,6 +288,29 @@ impl RemoteMap {
             .await
     }
 
+    /// Authorizes NAT traversal only if the existing actor still owns the exact connection.
+    ///
+    /// Unlike [`Self::send_to_actor`], this deliberately never creates or restarts an actor.
+    /// Losing either actor or connection must fail closed.
+    pub(super) async fn authorize_nat_traversal(
+        &mut self,
+        remote: EndpointId,
+        connection_id: usize,
+        reply: oneshot::Sender<bool>,
+    ) {
+        let Some(sender) = self.senders.read_only().get(&remote) else {
+            reply.send(false).ok();
+            return;
+        };
+        sender
+            .send(RemoteStateMessage::AuthorizeNatTraversal {
+                connection_id,
+                reply,
+            })
+            .await
+            .ok();
+    }
+
     /// Sends a message to a `RemoteStateActor`, starting it if not running already.
     ///
     /// When sending fails, the actor must be terminating, in which case we wait for its task to
@@ -339,6 +366,7 @@ impl Tasks {
             self.metrics.clone(),
             self.address_lookup.clone(),
             self.path_selector.clone(),
+            self.defer_nat_traversal_until_authorized,
         )
         .start(
             initial_msgs,
@@ -405,6 +433,7 @@ mod tests {
             address_lookup::AddressLookupServices::default(),
             shutdown_token.clone(),
             Arc::new(BiasedRttPathSelector::default()),
+            false,
             Span::none(),
         );
         let guards = (watchable, shutdown_token.clone().drop_guard());

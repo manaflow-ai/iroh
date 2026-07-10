@@ -46,7 +46,7 @@ use crate::{
         },
     },
     socket::{
-        RemoteStateActorStoppedError,
+        NatTraversalAuthorizer, RemoteStateActorStoppedError,
         remote_map::{PathEventStream, PathList, PathListStream, PathStateReceiver},
         transports::{self, LocalTransportAddr},
     },
@@ -165,8 +165,13 @@ impl Incoming {
         self,
         server_config: Arc<ServerConfig>,
     ) -> Result<Accepting, ConnectionError> {
+        let defer_nat_traversal = self
+            .ep
+            .inner
+            .static_config
+            .defer_nat_traversal_until_authorized;
         self.inner
-            .accept_with(server_config.to_inner_arc())
+            .accept_with(server_config.to_inner_arc(defer_nat_traversal))
             .map(|conn| Accepting::new(conn, self.ep))
     }
 
@@ -343,9 +348,13 @@ fn conn_from_noq_conn(
     // Check hooks
     let inner = ep.inner.clone();
     Ok(async move {
-        let paths = fut.await?;
+        let (paths, nat_traversal_authorizer) = fut.await?;
         let conn = Connection {
-            data: HandshakeCompletedData { info, paths },
+            data: HandshakeCompletedData {
+                info,
+                paths,
+                nat_traversal_authorizer,
+            },
             inner: conn,
         };
 
@@ -745,6 +754,7 @@ pub struct Connection<State: ConnectionState = HandshakeCompleted> {
 pub struct HandshakeCompletedData {
     info: StaticInfo,
     paths: PathStateReceiver,
+    nat_traversal_authorizer: NatTraversalAuthorizer,
 }
 
 /// Static info from a completed TLS handshake.
@@ -1111,6 +1121,19 @@ impl<T: ConnectionState> Connection<T> {
 }
 
 impl Connection<HandshakeCompleted> {
+    /// Authorizes NAT traversal for this exact connection.
+    ///
+    /// This is idempotent. It has an effect only when the endpoint was built with
+    /// [`Builder::defer_nat_traversal_until_authorized`](super::Builder::defer_nat_traversal_until_authorized).
+    /// The connection's relay or explicitly supplied initial direct path remains usable
+    /// before this call succeeds.
+    ///
+    /// Returns an error without authorizing the underlying connection when its endpoint,
+    /// remote-state actor, or exact connection state is no longer available.
+    pub async fn authorize_nat_traversal(&self) -> Result<(), NatTraversalAuthorizationError> {
+        self.data.nat_traversal_authorizer.authorize().await
+    }
+
     /// Extracts the ALPN protocol from the peer's handshake data.
     pub fn alpn(&self) -> &[u8] {
         &self.data.info.alpn
@@ -1195,6 +1218,12 @@ impl Connection<HandshakeCompleted> {
         }
     }
 }
+
+/// Error returned when NAT traversal cannot be authorized for the exact connection.
+#[stack_error(add_meta, derive)]
+#[error("connection state unavailable for NAT traversal authorization")]
+#[derive(Clone)]
+pub struct NatTraversalAuthorizationError;
 
 impl Connection<IncomingZeroRtt> {
     /// Extracts the ALPN protocol from the peer's handshake data.
