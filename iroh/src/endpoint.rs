@@ -1998,7 +1998,7 @@ mod tests {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, RwLock},
         time::{Duration, Instant},
     };
 
@@ -2012,7 +2012,7 @@ mod tests {
     use noq::PathStats;
     use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use tokio::sync::oneshot;
+    use tokio::sync::{mpsc, oneshot};
     use tracing::{Instrument, debug_span, error_span, info, info_span, instrument};
 
     use super::Endpoint;
@@ -4116,6 +4116,133 @@ mod tests {
             .await
             .std_context("waiting for endpoint to come online")?;
 
+        Ok(())
+    }
+
+    /// Replacing a relay configuration at the same URL must reconnect the
+    /// active relay client with the new token without replacing the endpoint
+    /// or its existing application connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_same_url_relay_token_rotation_preserves_connection() -> Result {
+        const TOKEN_A: &str = "token-a";
+        const TOKEN_B: &str = "token-b";
+
+        #[derive(Debug)]
+        struct RotatingTokenAccess {
+            expected: Arc<RwLock<String>>,
+            observed: mpsc::UnboundedSender<String>,
+        }
+
+        impl iroh_relay::server::AccessControl for RotatingTokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let token = request.auth_token().unwrap_or_default();
+                let _ = self.observed.send(token.clone());
+                if token == *self.expected.read().expect("token lock poisoned") {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+
+        let expected = Arc::new(RwLock::new(TOKEN_A.to_string()));
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let access = Arc::new(RotatingTokenAccess {
+            expected: expected.clone(),
+            observed: observed_tx,
+        });
+        let (_relay_map, relay_url, _guard) = run_relay_server_with_access(false, access).await?;
+        let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
+            .with_auth_token(TOKEN_A)
+            .into();
+
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(initial_map.clone()))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(initial_map))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for server relay")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for client relay")?;
+
+        let (client_done_tx, client_done_rx) = oneshot::channel();
+        let server_task: tokio::task::JoinHandle<Result<()>> = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let conn = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+
+                let mut before = [0; 6];
+                recv.read_exact(&mut before).await.anyerr()?;
+                assert_eq!(&before, b"before");
+                send.write_all(&before).await.anyerr()?;
+
+                let mut after = [0; 5];
+                recv.read_exact(&mut after).await.anyerr()?;
+                assert_eq!(&after, b"after");
+                send.write_all(&after).await.anyerr()?;
+                send.finish().anyerr()?;
+                let _ = client_done_rx.await;
+                Ok(())
+            })
+        };
+
+        let endpoint_id = client.id();
+        let connection = client.connect(server.addr(), TEST_ALPN).await?;
+        assert!(connection.paths().iter().all(|path| path.is_relay()));
+        let connection_id = connection.stable_id();
+        let (mut send, mut recv) = connection.open_bi().await.anyerr()?;
+        send.write_all(b"before").await.anyerr()?;
+        let mut echoed_before = [0; 6];
+        recv.read_exact(&mut echoed_before).await.anyerr()?;
+        assert_eq!(&echoed_before, b"before");
+
+        *expected.write().expect("token lock poisoned") = TOKEN_B.to_string();
+        client
+            .insert_relay(
+                relay_url.clone(),
+                Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(token) = observed_rx.recv().await {
+                if token == TOKEN_B {
+                    return;
+                }
+            }
+            panic!("relay access-control observation channel closed");
+        })
+        .await
+        .std_context("waiting for relay client to authenticate with rotated token")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for rotated relay connection")?;
+
+        assert_eq!(client.id(), endpoint_id);
+        assert_eq!(connection.stable_id(), connection_id);
+        send.write_all(b"after").await.anyerr()?;
+        send.finish().anyerr()?;
+        let mut echoed_after = [0; 5];
+        recv.read_exact(&mut echoed_after).await.anyerr()?;
+        assert_eq!(&echoed_after, b"after");
+        let _ = client_done_tx.send(());
+
+        server_task.await.anyerr()??;
+        client.close().await;
+        server.close().await;
         Ok(())
     }
 }
