@@ -1238,20 +1238,42 @@ impl EndpointInner {
         relay: RelayUrl,
         endpoint: Arc<RelayConfig>,
     ) -> Option<Arc<RelayConfig>> {
-        let res = self.relay_map.insert(relay, endpoint);
-        self.actor_sender
-            .send(ActorMessage::RelayMapChange)
+        let res = self.relay_map.insert(relay.clone(), endpoint.clone());
+        if res.as_deref() == Some(endpoint.as_ref()) {
+            return res;
+        }
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .actor_sender
+            .send(ActorMessage::RelayMapChange {
+                relay,
+                present: true,
+                done: done_tx,
+            })
             .await
-            .ok();
+            .is_ok()
+        {
+            let _ = done_rx.await;
+        }
         res
     }
 
     pub(crate) async fn remove_relay(&self, relay: &RelayUrl) -> Option<Arc<RelayConfig>> {
         let res = self.relay_map.remove(relay);
-        self.actor_sender
-            .send(ActorMessage::RelayMapChange)
+        res.as_ref()?;
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .actor_sender
+            .send(ActorMessage::RelayMapChange {
+                relay: relay.clone(),
+                present: false,
+                done: done_tx,
+            })
             .await
-            .ok();
+            .is_ok()
+        {
+            let _ = done_rx.await;
+        }
         res
     }
 
@@ -1380,7 +1402,11 @@ impl EndpointInner {
 #[allow(clippy::enum_variant_names)]
 enum ActorMessage {
     NetworkChange,
-    RelayMapChange,
+    RelayMapChange {
+        relay: RelayUrl,
+        present: bool,
+        done: oneshot::Sender<()>,
+    },
     #[debug("ResolveRemote(..)")]
     ResolveRemote(
         EndpointAddr,
@@ -1763,7 +1789,10 @@ impl Actor {
         self.remote_map.on_network_change(is_major);
     }
 
-    fn handle_relay_map_change(&mut self) {
+    async fn handle_relay_map_change(&mut self, relay: RelayUrl, present: bool) {
+        self.transports_network_change
+            .relay_config_changed(relay, present)
+            .await;
         self.re_stun(UpdateReason::RelayMapChange);
     }
 
@@ -1781,8 +1810,13 @@ impl Actor {
             ActorMessage::NetworkChange => {
                 self.network_monitor.network_change().await.ok();
             }
-            ActorMessage::RelayMapChange => {
-                self.handle_relay_map_change();
+            ActorMessage::RelayMapChange {
+                relay,
+                present,
+                done,
+            } => {
+                self.handle_relay_map_change(relay, present).await;
+                let _ = done.send(());
             }
             ActorMessage::ResolveRemote(addr, tx, cancellation) => {
                 self.remote_map.resolve_remote(addr, tx, cancellation).await;

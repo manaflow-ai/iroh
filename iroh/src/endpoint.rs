@@ -977,6 +977,9 @@ impl Endpoint {
     /// Adds the provided configuration to the [`RelayMap`].
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
+    /// If a client for this relay is active, it is restarted with the new
+    /// connection-scoped configuration (including its auth token). The
+    /// endpoint identity and existing QUIC connections are retained.
     ///
     /// Will also return `None` if the endpoint is closed.
     pub async fn insert_relay(

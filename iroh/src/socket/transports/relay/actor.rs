@@ -829,6 +829,13 @@ impl ConnectedRelayState {
 }
 
 pub(super) enum RelayActorMessage {
+    /// The shared relay map changed for this URL. Restart an active client so
+    /// connection-scoped configuration such as its auth token takes effect.
+    RelayConfigChanged {
+        url: RelayUrl,
+        present: bool,
+        done: oneshot::Sender<()>,
+    },
     MaybeCloseRelaysOnRebind,
     NetworkChange {
         report: Report,
@@ -1078,6 +1085,10 @@ impl RelayActor {
 
     async fn handle_msg(&mut self, msg: RelayActorMessage) {
         match msg {
+            RelayActorMessage::RelayConfigChanged { url, present, done } => {
+                self.on_relay_config_changed(url, present);
+                let _ = done.send(());
+            }
             RelayActorMessage::NetworkChange { report } => {
                 self.on_network_change(report).await;
             }
@@ -1088,6 +1099,39 @@ impl RelayActor {
                 self.check_connection_after_network_change().await;
             }
         }
+    }
+
+    fn on_relay_config_changed(&mut self, url: RelayUrl, present: bool) {
+        let was_home = self
+            .config
+            .my_relay
+            .get()
+            .as_ref()
+            .is_some_and(|status| status.url() == &url);
+        let previous = self.active_relays.remove(&url);
+        let was_active = previous.is_some();
+        if let Some(handle) = previous {
+            handle.stop_token.cancel();
+        }
+
+        if !present {
+            // Keep advertising the last known home relay until net-report has
+            // selected its replacement. Clearing it here publishes a transient
+            // endpoint address without any relay, even though re-STUN is already
+            // scheduled by the socket actor.
+            self.log_active_relay();
+            return;
+        }
+
+        if was_home {
+            self.config
+                .my_relay
+                .set(url.clone(), RelayConnectionState::Connecting);
+        }
+        if was_active || was_home {
+            self.active_relay_handle(url);
+        }
+        self.log_active_relay();
     }
 
     /// Sends datagrams to the correct [`ActiveRelayActor`], or returns a future.
@@ -1253,6 +1297,7 @@ impl RelayActor {
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
+        let stop_token = self.cancel_token.child_token();
         let opts = ActiveRelayActorOptions {
             url,
             prio_inbox_: prio_inbox_rx,
@@ -1260,7 +1305,7 @@ impl RelayActor {
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
-            stop_token: self.cancel_token.child_token(),
+            stop_token: stop_token.clone(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
         };
@@ -1275,6 +1320,7 @@ impl RelayActor {
             prio_inbox_addr: prio_inbox_tx,
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
+            stop_token,
         };
         self.log_active_relay();
         handle
@@ -1329,8 +1375,12 @@ impl RelayActor {
         self.active_relays
             .retain(|_url, handle| !handle.inbox_addr.is_closed());
 
-        // Make sure home relay exists
-        if let Some(status) = self.config.my_relay.get() {
+        // Make sure the configured home relay exists. A removed home remains
+        // published until net-report selects its replacement, but must not be
+        // restarted from a RelayConfig that is no longer in the map.
+        if let Some(status) = self.config.my_relay.get()
+            && self.config.relay_map.get(status.url()).is_some()
+        {
             self.active_relay_handle(status.url().clone());
         }
         self.log_active_relay();
@@ -1372,6 +1422,7 @@ struct ActiveRelayHandle {
     prio_inbox_addr: mpsc::Sender<ActiveRelayPrioMessage>,
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,
+    stop_token: CancellationToken,
 }
 
 /// A single datagram received from a relay server.
