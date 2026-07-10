@@ -19,7 +19,7 @@ use noq::{Closed, PathStats, PathStatus, WeakConnectionHandle};
 use noq_proto::{PathError, PathEvent as NoqPathEvent, PathId, n0_nat_traversal};
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
 
 use self::path_state::RemotePathState;
@@ -52,6 +52,43 @@ const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The latency at or under which we don't try to upgrade to a better path.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
+
+/// Maximum number of distinct paths waiting for a path-open retry.
+///
+/// A failed retry is attempted on every connection to the remote. Bounding and
+/// deduplicating this queue prevents that fan-out from growing it indefinitely.
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+#[derive(Default)]
+struct PendingOpenPaths {
+    entries: VecDeque<transports::FourTuple>,
+}
+
+impl PendingOpenPaths {
+    fn enqueue(&mut self, addr: transports::FourTuple) {
+        if self.entries.contains(&addr) {
+            return;
+        }
+        if self.entries.len() >= MAX_PENDING_OPEN_PATHS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(addr);
+    }
+
+    fn pop_front(&mut self) -> Option<transports::FourTuple> {
+        self.entries.pop_front()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, addr: &transports::FourTuple) -> bool {
+        self.entries.contains(addr)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 // TODO: use this
 // /// How long since the last activity we try to keep an established endpoint peering alive.
@@ -159,12 +196,15 @@ struct State {
     /// Paths which we still need to open.
     ///
     /// They failed to open because we did not have enough CIDs issued by the remote.
-    pending_open_paths: VecDeque<transports::FourTuple>,
+    pending_open_paths: PendingOpenPaths,
 
     // Internal state - address lookup
     //
     /// Stream of Address Lookup results, or always pending if Address Lookup is not running.
     address_lookup_stream: Option<BoxStream<Result<AddressLookupItem, AddressLookupFailed>>>,
+
+    /// Cancellation notifications for callers waiting on Address Lookup.
+    address_lookup_cancellations: FuturesUnordered<WaitForCancellationFutureOwned>,
 
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
@@ -198,8 +238,9 @@ impl RemoteStateActor {
                 selected_path: Default::default(),
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
-                pending_open_paths: VecDeque::new(),
+                pending_open_paths: PendingOpenPaths::default(),
                 address_lookup_stream: None,
+                address_lookup_cancellations: FuturesUnordered::new(),
                 path_selector,
             },
         }
@@ -275,6 +316,9 @@ impl RemoteStateActor {
                 _ = shutdown_token.cancelled() => {
                     trace!("actor cancelled");
                     break;
+                }
+                Some(()) = self.state.address_lookup_cancellations.next(), if !self.state.address_lookup_cancellations.is_empty() => {
+                    self.state.handle_resolve_cancellation(self.connections.is_empty());
                 }
                 msg = inbox.recv() => {
                     match msg {
@@ -362,8 +406,9 @@ impl RemoteStateActor {
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
             }
-            RemoteStateMessage::ResolveRemote(addrs, tx) => {
-                self.state.handle_msg_resolve_remote(addrs, tx);
+            RemoteStateMessage::ResolveRemote(addrs, tx, cancellation) => {
+                self.state
+                    .handle_msg_resolve_remote(addrs, tx, cancellation);
             }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
@@ -851,12 +896,28 @@ impl State {
         &mut self,
         addrs: BTreeSet<TransportAddr>,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
     ) {
         let addrs = to_transports_addr(self.endpoint_id, addrs);
         self.paths.insert_multiple(addrs, Source::App);
-        self.paths.resolve_remote(tx);
+        if self.paths.resolve_remote(tx, cancellation.clone()) {
+            self.address_lookup_cancellations
+                .push(cancellation.cancelled_owned());
+        }
         // Start Address Lookup if we have no selected path.
         self.trigger_address_lookup();
+    }
+
+    /// Releases a lookup once every caller waiting on an address has cancelled.
+    fn handle_resolve_cancellation(&mut self, connections_are_empty: bool) {
+        self.paths.prune_cancelled_resolve_requests();
+        if connections_are_empty
+            && self.selected_path.is_none()
+            && self.paths.is_empty()
+            && self.paths.resolve_requests_is_empty()
+        {
+            self.address_lookup_stream = None;
+        }
     }
 
     /// Triggers Address Lookup for the remote endpoint, if needed.
@@ -1059,7 +1120,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        self.pending_open_paths.enqueue(open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1177,6 +1238,7 @@ pub(crate) enum RemoteStateMessage {
     ResolveRemote(
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
+        CancellationToken,
     ),
     /// Returns information about the remote.
     ///
@@ -1526,5 +1588,45 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::{MAX_PENDING_OPEN_PATHS, PendingOpenPaths};
+    use crate::socket::transports::FourTuple;
+
+    fn ip_path(port: u16) -> FourTuple {
+        FourTuple::Ip {
+            remote: SocketAddr::from(([192, 0, 2, 1], port)),
+            local: None,
+        }
+    }
+
+    #[test]
+    fn pending_open_paths_are_bounded_across_multi_connection_retries() {
+        let repeated_path = ip_path(1);
+        let mut pending = PendingOpenPaths::default();
+
+        // Each retry is fanned out to every connection. Two capped
+        // connections must not double the queue on every retry cycle.
+        for _ in 0..1_024 {
+            for _connection in 0..2 {
+                pending.enqueue(repeated_path.clone());
+            }
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&repeated_path));
+
+        // A peer can advertise many distinct unreachable candidates. Retain
+        // only a fixed working set and prefer newer observations when full.
+        for port in 2..=(MAX_PENDING_OPEN_PATHS as u16 + 10) {
+            pending.enqueue(ip_path(port));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
+        assert!(!pending.contains(&ip_path(1)));
+        assert!(pending.contains(&ip_path(MAX_PENDING_OPEN_PATHS as u16 + 10)));
     }
 }
