@@ -2501,6 +2501,230 @@ mod tests {
         Ok(())
     }
 
+    fn assert_relay_only(conn: &Connection) {
+        let paths = conn.paths();
+        assert!(
+            !paths.is_empty(),
+            "connection must retain its bootstrap path"
+        );
+        assert!(
+            paths.iter().all(|path| path.is_relay()),
+            "deferred connection opened a non-relay path before authorization: {paths:?}"
+        );
+    }
+
+    async fn wait_for_direct(conn: &Connection) -> Result {
+        time::timeout(Duration::from_secs(10), async {
+            let mut paths = conn.paths_stream();
+            while let Some(paths) = paths.next().await {
+                if paths.iter().any(|path| path.is_ip()) {
+                    return;
+                }
+            }
+            panic!("connection closed before establishing a direct path");
+        })
+        .await
+        .anyerr()?;
+        Ok(())
+    }
+
+    async fn exchange_pre_admission_control_stream(
+        client: &Connection,
+        server: &Connection,
+    ) -> Result {
+        let send = async {
+            let (mut send, mut recv) = client.open_bi().await.anyerr()?;
+            send.write_all(b"admission").await.anyerr()?;
+            send.finish().anyerr()?;
+            let reply = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(reply, b"accepted");
+            Ok::<_, Error>(())
+        };
+        let receive = async {
+            let (mut send, mut recv) = server.accept_bi().await.anyerr()?;
+            let request = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(request, b"admission");
+            send.write_all(b"accepted").await.anyerr()?;
+            send.finish().anyerr()?;
+            Ok::<_, Error>(())
+        };
+        tokio::try_join!(send, receive)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_waits_for_exact_connection_authorization() -> Result {
+        let (relay_map, relay_url, _relay_guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        tokio::try_join!(server.online(), client.online()).anyerr()?;
+
+        let server_id = server.id();
+        let client_id = client.id();
+        let server_addr = EndpointAddr::new(server_id).with_relay_url(relay_url);
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let client_conn = client.connect(server_addr, TEST_ALPN).await?;
+        let server_conn = accept.await.anyerr()??;
+        let client_conn_id = client_conn.stable_id();
+        let server_conn_id = server_conn.stable_id();
+
+        exchange_pre_admission_control_stream(&client_conn, &server_conn).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
+
+        let churn_addr: SocketAddr = "198.51.100.10:4242".parse().expect("valid test address");
+        client.add_external_addr(churn_addr).await;
+        assert!(client.remove_external_addr(&churn_addr).await);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
+
+        server_conn.authorize_nat_traversal().await?;
+        client_conn.authorize_nat_traversal().await?;
+        server_conn.authorize_nat_traversal().await?;
+        client_conn.authorize_nat_traversal().await?;
+        tokio::try_join!(wait_for_direct(&client_conn), wait_for_direct(&server_conn))?;
+
+        assert_eq!(
+            client.id(),
+            client_id,
+            "authorization recreated the client endpoint"
+        );
+        assert_eq!(
+            server.id(),
+            server_id,
+            "authorization recreated the server endpoint"
+        );
+        assert_eq!(client_conn.stable_id(), client_conn_id);
+        assert_eq!(server_conn.stable_id(), server_conn_id);
+
+        let churn_addr: SocketAddr = "198.51.100.11:4243".parse().expect("valid test address");
+        server.add_external_addr(churn_addr).await;
+        assert!(server.remove_external_addr(&churn_addr).await);
+        tokio::try_join!(wait_for_direct(&client_conn), wait_for_direct(&server_conn))?;
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_does_not_authorize_reconnect_from_cached_path() -> Result {
+        let (relay_map, relay_url, _relay_guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        tokio::try_join!(server.online(), client.online()).anyerr()?;
+        let relay_addr = EndpointAddr::new(server.id()).with_relay_url(relay_url);
+
+        let accept_first = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let first_client = client.connect(relay_addr.clone(), TEST_ALPN).await?;
+        let first_server = accept_first.await.anyerr()??;
+        first_server.authorize_nat_traversal().await?;
+        first_client.authorize_nat_traversal().await?;
+        tokio::try_join!(
+            wait_for_direct(&first_client),
+            wait_for_direct(&first_server)
+        )?;
+
+        let accept_second = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let second_client = client.connect(relay_addr, TEST_ALPN).await?;
+        let second_server = accept_second.await.anyerr()??;
+        assert_ne!(first_client.stable_id(), second_client.stable_id());
+        assert_ne!(first_server.stable_id(), second_server.stable_id());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+
+        // Re-authorizing the first connection and changing candidates must not
+        // authorize another connection to the same EndpointId.
+        first_server.authorize_nat_traversal().await?;
+        first_client.authorize_nat_traversal().await?;
+        let churn_addr: SocketAddr = "198.51.100.12:4244".parse().expect("valid test address");
+        client.add_external_addr(churn_addr).await;
+        assert!(client.remove_external_addr(&churn_addr).await);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+
+        second_server.authorize_nat_traversal().await?;
+        second_client.authorize_nat_traversal().await?;
+        tokio::try_join!(
+            wait_for_direct(&second_client),
+            wait_for_direct(&second_server)
+        )?;
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_allows_explicit_initial_direct_path() -> Result {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let client_conn = client.connect(server.addr(), TEST_ALPN).await?;
+        let server_conn = accept.await.anyerr()??;
+
+        exchange_pre_admission_control_stream(&client_conn, &server_conn).await?;
+        assert!(client_conn.paths().iter().any(|path| path.is_ip()));
+        assert!(server_conn.paths().iter().any(|path| path.is_ip()));
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn endpoint_two_relay_only_no_ip() -> Result {
