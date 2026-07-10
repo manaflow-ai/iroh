@@ -9,6 +9,7 @@ use n0_error::e;
 use n0_future::time::Instant;
 use rustc_hash::FxHashMap;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
 use super::{Source, TransportAddrInfo, TransportAddrUsage};
@@ -34,8 +35,14 @@ pub(super) struct RemotePathState {
     /// mechanisms. The are only potentially usable.
     paths: FxHashMap<transports::Addr, PathState>,
     /// Pending resolve requests from [`Self::resolve_remote`].
-    pending_resolve_requests: VecDeque<oneshot::Sender<Result<(), AddressLookupFailed>>>,
+    pending_resolve_requests: VecDeque<PendingResolveRequest>,
     metrics: Arc<SocketMetrics>,
+}
+
+#[derive(Debug)]
+struct PendingResolveRequest {
+    reply: oneshot::Sender<Result<(), AddressLookupFailed>>,
+    cancellation: CancellationToken,
 }
 
 /// Describes the usability of this path, i.e. whether it has ever been opened,
@@ -158,12 +165,28 @@ impl RemotePathState {
     /// If there already is a known path, `Ok(())` is returned immediately. Otherwise an
     /// address lookup is performed and the result is sent back once that
     /// completes. [`AddressLookupFailed`] is sent if there are no known paths.
-    pub(super) fn resolve_remote(&mut self, tx: oneshot::Sender<Result<(), AddressLookupFailed>>) {
+    pub(super) fn resolve_remote(
+        &mut self,
+        tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
+    ) -> bool {
         if !self.paths.is_empty() {
             tx.send(Ok(())).ok();
+            false
         } else {
-            self.pending_resolve_requests.push_back(tx);
+            self.pending_resolve_requests
+                .push_back(PendingResolveRequest {
+                    reply: tx,
+                    cancellation,
+                });
+            true
         }
+    }
+
+    /// Removes resolve requests whose caller has cancelled or gone away.
+    pub(super) fn prune_cancelled_resolve_requests(&mut self) {
+        self.pending_resolve_requests
+            .retain(|request| !request.cancellation.is_cancelled() && !request.reply.is_closed());
     }
 
     /// Returns `true` if there are any queued resolve requests from [`Self::resolve_remote`].
@@ -201,8 +224,8 @@ impl RemotePathState {
             (true, Some(err)) => Err(err),
             (true, None) => Err(e!(AddressLookupFailed::NoResults { errors: Vec::new() })),
         };
-        for tx in self.pending_resolve_requests.drain(..) {
-            tx.send(result.clone()).ok();
+        for request in self.pending_resolve_requests.drain(..) {
+            request.reply.send(result.clone()).ok();
         }
     }
 
@@ -649,7 +672,7 @@ mod tests {
         let mut state = RemotePathState::new(metrics);
 
         let (tx, mut rx) = oneshot::channel();
-        state.resolve_remote(tx);
+        state.resolve_remote(tx, CancellationToken::new());
 
         // Second concurrent resolve arrives with empty addrs (no app-provided
         // addresses) while address lookup is still running.
@@ -676,7 +699,7 @@ mod tests {
         let mut state = RemotePathState::new(metrics);
 
         let (tx, mut rx) = oneshot::channel();
-        state.resolve_remote(tx);
+        state.resolve_remote(tx, CancellationToken::new());
 
         state.address_lookup_finished(Ok(()));
 
@@ -685,5 +708,34 @@ mod tests {
             resolved,
             Err(AddressLookupFailed::NoResults { .. })
         ));
+    }
+
+    /// Cancelling one resolve must not release another caller sharing its lookup.
+    #[test]
+    fn cancelled_resolve_preserves_live_waiters() {
+        let metrics = Arc::new(SocketMetrics::default());
+        let mut state = RemotePathState::new(metrics);
+        let cancelled = CancellationToken::new();
+        let live = CancellationToken::new();
+        let (cancelled_tx, mut cancelled_rx) = oneshot::channel();
+        let (live_tx, mut live_rx) = oneshot::channel();
+        assert!(state.resolve_remote(cancelled_tx, cancelled.clone()));
+        assert!(state.resolve_remote(live_tx, live));
+
+        cancelled.cancel();
+        state.prune_cancelled_resolve_requests();
+        assert!(matches!(
+            cancelled_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(live_rx.try_recv().is_err());
+
+        state.insert_multiple([ip_addr(4242)].into_iter(), Source::App);
+        assert!(
+            live_rx
+                .try_recv()
+                .expect("live waiter was not woken")
+                .is_ok()
+        );
     }
 }

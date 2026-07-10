@@ -19,7 +19,7 @@ use noq::{Closed, PathStats, PathStatus, WeakConnectionHandle};
 use noq_proto::{PathError, PathEvent as NoqPathEvent, PathId, n0_nat_traversal};
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
 
 use self::path_state::RemotePathState;
@@ -203,6 +203,9 @@ struct State {
     /// Stream of Address Lookup results, or always pending if Address Lookup is not running.
     address_lookup_stream: Option<BoxStream<Result<AddressLookupItem, AddressLookupFailed>>>,
 
+    /// Cancellation notifications for callers waiting on Address Lookup.
+    address_lookup_cancellations: FuturesUnordered<WaitForCancellationFutureOwned>,
+
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
 }
@@ -237,6 +240,7 @@ impl RemoteStateActor {
                 scheduled_open_path: None,
                 pending_open_paths: PendingOpenPaths::default(),
                 address_lookup_stream: None,
+                address_lookup_cancellations: FuturesUnordered::new(),
                 path_selector,
             },
         }
@@ -312,6 +316,9 @@ impl RemoteStateActor {
                 _ = shutdown_token.cancelled() => {
                     trace!("actor cancelled");
                     break;
+                }
+                Some(()) = self.state.address_lookup_cancellations.next(), if !self.state.address_lookup_cancellations.is_empty() => {
+                    self.state.handle_resolve_cancellation(self.connections.is_empty());
                 }
                 msg = inbox.recv() => {
                     match msg {
@@ -399,8 +406,9 @@ impl RemoteStateActor {
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
             }
-            RemoteStateMessage::ResolveRemote(addrs, tx) => {
-                self.state.handle_msg_resolve_remote(addrs, tx);
+            RemoteStateMessage::ResolveRemote(addrs, tx, cancellation) => {
+                self.state
+                    .handle_msg_resolve_remote(addrs, tx, cancellation);
             }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
@@ -888,12 +896,28 @@ impl State {
         &mut self,
         addrs: BTreeSet<TransportAddr>,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
     ) {
         let addrs = to_transports_addr(self.endpoint_id, addrs);
         self.paths.insert_multiple(addrs, Source::App);
-        self.paths.resolve_remote(tx);
+        if self.paths.resolve_remote(tx, cancellation.clone()) {
+            self.address_lookup_cancellations
+                .push(cancellation.cancelled_owned());
+        }
         // Start Address Lookup if we have no selected path.
         self.trigger_address_lookup();
+    }
+
+    /// Releases a lookup once every caller waiting on an address has cancelled.
+    fn handle_resolve_cancellation(&mut self, connections_are_empty: bool) {
+        self.paths.prune_cancelled_resolve_requests();
+        if connections_are_empty
+            && self.selected_path.is_none()
+            && self.paths.is_empty()
+            && self.paths.resolve_requests_is_empty()
+        {
+            self.address_lookup_stream = None;
+        }
     }
 
     /// Triggers Address Lookup for the remote endpoint, if needed.
@@ -1214,6 +1238,7 @@ pub(crate) enum RemoteStateMessage {
     ResolveRemote(
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
+        CancellationToken,
     ),
     /// Returns information about the remote.
     ///
