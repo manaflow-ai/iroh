@@ -652,8 +652,12 @@ impl Stream for AddressLookupStream {
 mod tests {
     use std::{
         collections::HashMap,
+        future,
         net::SocketAddr,
-        sync::{Arc, Mutex},
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, SystemTime},
     };
 
@@ -662,6 +666,7 @@ mod tests {
     use n0_future::{StreamExt, time};
     use n0_tracing_test::traced_test;
     use rand::{CryptoRng, RngExt, SeedableRng};
+    use tokio::sync::mpsc;
     use tokio_util::task::AbortOnDropHandle;
 
     use super::*;
@@ -807,7 +812,91 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct LookupDropProbe {
+        active: Arc<AtomicUsize>,
+        dropped: mpsc::UnboundedSender<()>,
+    }
+
+    impl Drop for LookupDropProbe {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            self.dropped.send(()).ok();
+        }
+    }
+
+    /// A hanging lookup that reports when its in-flight resolve future is dropped.
+    #[derive(Debug, Clone)]
+    struct DropObservedHangingAddressLookup {
+        active: Arc<AtomicUsize>,
+        started: mpsc::UnboundedSender<()>,
+        dropped: mpsc::UnboundedSender<()>,
+    }
+
+    impl AddressLookup for DropObservedHangingAddressLookup {
+        fn publish(&self, _data: &EndpointData) {}
+
+        fn resolve(&self, _endpoint_id: EndpointId) -> Option<BoxStream<Result<Item, Error>>> {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.clone();
+            let started = self.started.clone();
+            let dropped = self.dropped.clone();
+            let fut = async move {
+                let _probe = LookupDropProbe { active, dropped };
+                started.send(()).ok();
+                future::pending::<Result<Item, Error>>().await
+            };
+            Some(n0_future::stream::once_future(fut).boxed())
+        }
+    }
+
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
+
+    /// Cancelling a dial must release a hanging lookup before endpoint shutdown.
+    #[tokio::test]
+    #[traced_test]
+    async fn cancelled_connect_drops_hanging_address_lookup() -> Result {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0u64);
+        let active = Arc::new(AtomicUsize::new(0));
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (dropped_tx, mut dropped_rx) = mpsc::unbounded_channel();
+        let lookup = DropObservedHangingAddressLookup {
+            active: active.clone(),
+            started: started_tx,
+            dropped: dropped_tx,
+        };
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&rng.random()))
+            .address_lookup(lookup)
+            .bind()
+            .await?;
+        let offline_id = SecretKey::from_bytes(&rng.random()).public();
+
+        let connect = tokio::spawn({
+            let endpoint = endpoint.clone();
+            async move { endpoint.connect(offline_id, TEST_ALPN).await }
+        });
+        time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .expect("hanging lookup was not polled")
+            .expect("lookup start channel closed");
+
+        connect.abort();
+        assert!(
+            connect
+                .await
+                .expect_err("connect unexpectedly completed")
+                .is_cancelled()
+        );
+        time::timeout(Duration::from_secs(1), dropped_rx.recv())
+            .await
+            .expect("cancelled connect retained its hanging lookup")
+            .expect("lookup drop channel closed");
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+
+        endpoint.close().await;
+        Ok(())
+    }
 
     /// This is a smoke test for our Address Lookupmechanism.
     #[tokio::test]
