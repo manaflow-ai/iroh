@@ -9,6 +9,11 @@ members = [
 ]
 resolver = "2"
 
+[patch.crates-io]
+noq = { git = "https://github.com/manaflow-ai/noq", rev = "05055f887961418285a39a41da72c5b6e738cbaf" }
+noq-proto = { git = "https://github.com/manaflow-ai/noq", rev = "05055f887961418285a39a41da72c5b6e738cbaf" }
+noq-udp = { git = "https://github.com/manaflow-ai/noq", rev = "05055f887961418285a39a41da72c5b6e738cbaf" }
+
 [profile.release]
 debug = true
 
