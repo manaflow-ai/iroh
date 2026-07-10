@@ -3159,7 +3159,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.0.1"
-source = "git+https://github.com/manaflow-ai/noq?rev=d8534ca45d2f00a3db06914b9f265b8f53d35d03#d8534ca45d2f00a3db06914b9f265b8f53d35d03"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3180,7 +3180,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.0.1"
-source = "git+https://github.com/manaflow-ai/noq?rev=d8534ca45d2f00a3db06914b9f265b8f53d35d03#d8534ca45d2f00a3db06914b9f265b8f53d35d03"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3210,7 +3210,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.0.1"
-source = "git+https://github.com/manaflow-ai/noq?rev=d8534ca45d2f00a3db06914b9f265b8f53d35d03#d8534ca45d2f00a3db06914b9f265b8f53d35d03"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "cfg_aliases",
  "libc",
