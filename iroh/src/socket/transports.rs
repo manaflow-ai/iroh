@@ -1385,11 +1385,12 @@ impl noq::UdpSender for Sender {
 
         let network_path = match mapped_addr {
             MultipathMappedAddr::Mixed(mapped_addr) => {
-                let Some(endpoint_id) = self.sock.mapped_addrs.endpoint_addrs.lookup(&mapped_addr)
+                let Some(authority) = self.sock.mapped_addrs.endpoint_addrs.lookup(&mapped_addr)
                 else {
                     error!(dst = ?mapped_addr, "unknown NodeIdMappedAddr, dropped transmit");
                     return Poll::Ready(Ok(()));
                 };
+                let endpoint_id = authority.endpoint_id();
 
                 // Note we drop the src_ip set in the Noq Transmit.  This is only the
                 // Initial packet we are sending, so we do not yet have an src address we
@@ -1402,6 +1403,7 @@ impl noq::UdpSender for Sender {
                 match self.sock.try_send_remote_state_msg(
                     endpoint_id,
                     super::RemoteStateMessage::SendDatagram(
+                        authority,
                         Box::new(self.sender.clone()),
                         OwnedTransmit::from(noq_transmit),
                     ),

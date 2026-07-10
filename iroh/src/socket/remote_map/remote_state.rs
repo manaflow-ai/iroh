@@ -17,7 +17,7 @@ use n0_future::{
 use n0_watcher::Watcher;
 use noq::{Closed, PathStats, PathStatus, WeakConnectionHandle};
 use noq_proto::{PathError, PathEvent as NoqPathEvent, PathId, n0_nat_traversal};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
@@ -28,7 +28,7 @@ pub use self::{
     path_watcher::{Path, PathEvent, PathEventStream, PathList, PathListIter, PathListStream},
     remote_info::{RemoteInfo, TransportAddrInfo, TransportAddrUsage},
 };
-use super::Source;
+use super::{BootstrapAuthority, Source};
 use crate::{
     address_lookup::{AddressLookupFailed, AddressLookupServices, Item as AddressLookupItem},
     endpoint::DirectAddr,
@@ -162,12 +162,6 @@ struct State {
     address_lookup: AddressLookupServices,
     /// Whether each connection requires application authorization before NAT traversal.
     defer_nat_traversal_until_authorized: bool,
-    /// Addresses explicitly supplied for the most recent outgoing connection attempt.
-    ///
-    /// Relay paths are always valid bootstrap paths. Direct and custom paths are only
-    /// valid before authorization when the application supplied them for this attempt.
-    explicit_bootstrap_addrs: FxHashSet<transports::Addr>,
-
     // Internal state - Noq Connections we are managing.
     //
     /// Notifications when connections are closed.
@@ -239,7 +233,6 @@ impl RemoteStateActor {
                 custom_mapped_addrs,
                 address_lookup,
                 defer_nat_traversal_until_authorized,
-                explicit_bootstrap_addrs: Default::default(),
                 connections_close: Default::default(),
                 path_events: Default::default(),
                 addr_events: Default::default(),
@@ -433,8 +426,10 @@ impl RemoteStateActor {
     async fn handle_message(&mut self, msg: RemoteStateMessage) {
         // trace!("handling message");
         match msg {
-            RemoteStateMessage::SendDatagram(sender, transmit) => {
-                self.state.handle_msg_send_datagram(sender, transmit).await;
+            RemoteStateMessage::SendDatagram(authority, sender, transmit) => {
+                self.state
+                    .handle_msg_send_datagram(authority, sender, transmit)
+                    .await;
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
@@ -1058,6 +1053,7 @@ impl State {
     /// Handles [`RemoteStateMessage::SendDatagram`].
     async fn handle_msg_send_datagram(
         &mut self,
+        authority: BootstrapAuthority,
         mut sender: Box<TransportsSender>,
         transmit: OwnedTransmit,
     ) {
@@ -1070,7 +1066,7 @@ impl State {
         if let Some(addr) = self
             .selected_path
             .as_ref()
-            .filter(|addr| self.bootstrap_path_allowed(&addr.remote()))
+            .filter(|addr| self.bootstrap_path_allowed(&authority, &addr.remote()))
         {
             trace!(?addr, "sending datagram to selected path");
 
@@ -1093,7 +1089,7 @@ impl State {
             let bootstrap_paths = self
                 .paths
                 .addrs()
-                .filter(|addr| self.bootstrap_path_allowed(addr))
+                .filter(|addr| self.bootstrap_path_allowed(&authority, addr))
                 .cloned()
                 .collect::<Vec<_>>();
             for addr in bootstrap_paths {
@@ -1135,10 +1131,6 @@ impl State {
         cancellation: CancellationToken,
     ) {
         let addrs = to_transports_addr(self.endpoint_id, addrs).collect::<Vec<_>>();
-        if self.defer_nat_traversal_until_authorized {
-            self.explicit_bootstrap_addrs.clear();
-            self.explicit_bootstrap_addrs.extend(addrs.iter().cloned());
-        }
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         if self.paths.resolve_remote(tx, cancellation.clone()) {
             self.address_lookup_cancellations
@@ -1356,10 +1348,14 @@ impl State {
             .collect()
     }
 
-    fn bootstrap_path_allowed(&self, addr: &transports::Addr) -> bool {
-        !self.defer_nat_traversal_until_authorized
-            || addr.is_relay()
-            || self.explicit_bootstrap_addrs.contains(addr)
+    fn bootstrap_path_allowed(
+        &self,
+        authority: &BootstrapAuthority,
+        addr: &transports::Addr,
+    ) -> bool {
+        authority.endpoint_id() == self.endpoint_id
+            && (!self.defer_nat_traversal_until_authorized
+                || authority.permits(self.endpoint_id, addr))
     }
 }
 
@@ -1418,7 +1414,7 @@ pub(crate) enum RemoteStateMessage {
     /// operation with a bunch more copying.  So it should only be used for sending QUIC
     /// Initial packets.
     #[debug("SendDatagram(..)")]
-    SendDatagram(Box<TransportsSender>, OwnedTransmit),
+    SendDatagram(BootstrapAuthority, Box<TransportsSender>, OwnedTransmit),
     /// Adds an active connection to this remote endpoint.
     ///
     /// The actor will downgrade the connection to a [`noq::WeakConnectionHandle`] as soon

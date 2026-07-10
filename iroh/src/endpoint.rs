@@ -1147,7 +1147,7 @@ impl Endpoint {
             "connecting",
         );
 
-        let mapped_addr = self.inner.resolve_remote(endpoint_addr).await??;
+        let resolved_remote = self.inner.resolve_remote(endpoint_addr).await??;
 
         let transport_config = options
             .transport_config
@@ -1169,14 +1169,19 @@ impl Endpoint {
             .static_config
             .create_client_config(alpn_protocols, transport_config.clone());
 
-        let dest_addr = mapped_addr.private_socket_addr();
+        let dest_addr = resolved_remote.mapped_addr().private_socket_addr();
         let server_name = &tls::name::encode(endpoint_id);
         let connect =
             self.inner
                 .noq_endpoint()
                 .connect_with(client_config, dest_addr, server_name)?;
 
-        Ok(Connecting::new(connect, self.clone(), endpoint_id))
+        Ok(Connecting::new(
+            connect,
+            self.clone(),
+            endpoint_id,
+            resolved_remote,
+        ))
     }
 
     /// Accepts an incoming connection on the endpoint.
@@ -2052,7 +2057,7 @@ mod tests {
             ConnectWithOptsError, Connection, ConnectionError, PathEvent, PathEventStream, presets,
         },
         protocol::{AcceptError, ProtocolHandler, Router},
-        socket::mapped_addrs::{EndpointIdMappedAddr, MappedAddr},
+        socket::{mapped_addrs::MappedAddr, remote_map::ResolvedRemote},
         test_utils::{
             QlogFileGroup, run_relay_server, run_relay_server_with, run_relay_server_with_access,
         },
@@ -2862,16 +2867,16 @@ mod tests {
         // authenticated EndpointId but carry disjoint, caller-supplied bootstrap addresses.
         // The two returned mapped addresses pause and identify the attempts until Noq sends
         // their Initials below.
-        let mapped_a = inner
+        let resolved_a = inner
             .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_a_addr))
             .await
             .anyerr()??;
-        let mapped_b = inner
+        let resolved_b = inner
             .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_b_addr))
             .await
             .anyerr()??;
 
-        let start_dial = |mapped_addr: EndpointIdMappedAddr, alpn: &[u8]| {
+        let start_dial = |resolved: &ResolvedRemote, alpn: &[u8]| {
             let transport_config = inner
                 .static_config
                 .transport_config
@@ -2883,12 +2888,12 @@ mod tests {
                 .create_client_config(vec![alpn.to_vec()], transport_config);
             inner.noq_endpoint().connect_with(
                 client_config,
-                mapped_addr.private_socket_addr(),
+                resolved.mapped_addr().private_socket_addr(),
                 &tls::name::encode(server_id),
             )
         };
-        let dial_a = start_dial(mapped_a, ALPN_A).anyerr()?;
-        let dial_b = start_dial(mapped_b, ALPN_B).anyerr()?;
+        let dial_a = start_dial(&resolved_a, ALPN_A).anyerr()?;
+        let dial_b = start_dial(&resolved_b, ALPN_B).anyerr()?;
 
         let (server_conn_a, server_conn_b, _client_conn_a, _client_conn_b) =
             time::timeout(Duration::from_secs(5), async {

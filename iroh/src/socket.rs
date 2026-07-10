@@ -78,7 +78,10 @@ use crate::{
     runtime::Runtime,
     socket::{
         concurrent_read_map::ReadOnlyMap,
-        remote_map::{MappedAddrs, PathSelector, PathStateReceiver, RemoteInfo},
+        remote_map::{
+            BootstrapAuthority, MappedAddrs, PathSelector, PathStateReceiver, RemoteInfo,
+            ResolvedRemote,
+        },
         transports::{HomeRelayWatch, HomeRelayWatcher},
     },
     tls::{
@@ -95,7 +98,7 @@ pub(crate) mod mapped_addrs;
 pub(crate) mod remote_map;
 pub(crate) mod transports;
 
-use self::mapped_addrs::{EndpointIdMappedAddr, MappedAddr};
+use self::mapped_addrs::MappedAddr;
 pub use self::metrics::Metrics;
 
 // TODO: Use this
@@ -1352,15 +1355,17 @@ impl EndpointInner {
             .ok();
     }
 
-    /// Resolves an [`EndpointAddr`] to an [`EndpointIdMappedAddr`] to connect to via [`EndpointInner::endpoint`].
+    /// Resolves an [`EndpointAddr`] to a unique outgoing dial token.
     ///
     /// This starts a `RemoteStateActor` for the remote if not running already, and then checks
     /// if the actor has any known paths to the remote. If not, it starts address lookup and waits for
     /// at least one result to arrive.
     ///
-    /// Returns `Ok(Ok(EndpointIdMappedAddr))` if there is a known path or Address Lookup produced
-    /// at least one result. This does not mean there is a working path, only that we have at least
-    /// one transport address we can try to connect to.
+    /// Returns `Ok(Ok(ResolvedRemote))` if there is a known path or Address Lookup produced at
+    /// least one result. Its mapped address identifies this exact dial and keeps the immutable
+    /// bootstrap authority registered until the connection attempt completes or is dropped. This
+    /// does not mean there is a working path, only that we have at least one transport address we
+    /// can try to connect to.
     ///
     /// Returns `Ok(Err(address_lookup_error))` if there are no known paths to the remote and Address Lookup
     /// failed or produced no results. This means that we don't have any transport address for
@@ -1371,19 +1376,19 @@ impl EndpointInner {
     pub(crate) async fn resolve_remote(
         &self,
         addr: EndpointAddr,
-    ) -> Result<Result<EndpointIdMappedAddr, AddressLookupFailed>, RemoteStateActorStoppedError>
-    {
+    ) -> Result<Result<ResolvedRemote, AddressLookupFailed>, RemoteStateActorStoppedError> {
         let (tx, rx) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
         let remote_id = addr.id;
+        let authority = BootstrapAuthority::new(remote_id, addr.addrs.clone());
         self.actor_sender
             .send(ActorMessage::ResolveRemote(addr, tx, cancellation))
             .await
             .ok();
         let reply = rx.await.map_err(|_| RemoteStateActorStoppedError::new())?;
         match reply {
-            Ok(()) => Ok(Ok(self.mapped_addrs.endpoint_addrs.get(&remote_id))),
+            Ok(()) => Ok(Ok(ResolvedRemote::register(&self.mapped_addrs, authority))),
             Err(err) => Ok(Err(err)),
         }
     }
@@ -2831,7 +2836,7 @@ mod tests {
             socket_connect(
                 sock_1.noq_endpoint().clone(),
                 secret_key_1.clone(),
-                addr,
+                addr.mapped_addr(),
                 endpoint_id_2,
             ),
         )
@@ -2911,13 +2916,14 @@ mod tests {
         let res = socket_connect_with_transport_config(
             sock_1.noq_endpoint().clone(),
             secret_key_1.clone(),
-            addr_2,
+            addr_2.mapped_addr(),
             endpoint_id_2,
             Arc::new(transport_config),
         )
         .await;
         assert!(res.is_err(), "expected timeout");
         info!("first connect timed out as expected");
+        drop(addr_2);
 
         // Provide correct addressing information
         let correct_addr_2 = EndpointAddr::from_parts(
@@ -2933,15 +2939,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(addr_2, addr_2a);
-
         // We can now connect
         tokio::time::timeout(Duration::from_secs(10), async move {
             info!("establishing new connection");
             let conn = socket_connect(
                 sock_1.noq_endpoint().clone(),
                 secret_key_1.clone(),
-                addr_2,
+                addr_2a.mapped_addr(),
                 endpoint_id_2,
             )
             .await

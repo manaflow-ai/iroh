@@ -47,7 +47,9 @@ use crate::{
     },
     socket::{
         NatTraversalAuthorizer, RemoteStateActorStoppedError,
-        remote_map::{PathEventStream, PathList, PathListStream, PathStateReceiver},
+        remote_map::{
+            PathEventStream, PathList, PathListStream, PathStateReceiver, ResolvedRemote,
+        },
         transports::{self, LocalTransportAddr},
     },
 };
@@ -430,6 +432,8 @@ pub struct Connecting {
     ep: Endpoint,
     /// `Some(remote_id)` if this is an outgoing connection, `None` if this is an incoming conn
     remote_endpoint_id: EndpointId,
+    /// Keeps this dial's immutable bootstrap authority registered while Initials may be sent.
+    dial_attempt: ResolvedRemote,
 }
 
 type RegisterWithSocketFut = BoxFuture<Result<Connection, ConnectingError>>;
@@ -489,12 +493,14 @@ impl Connecting {
         inner: noq::Connecting,
         ep: Endpoint,
         remote_endpoint_id: EndpointId,
+        dial_attempt: ResolvedRemote,
     ) -> Self {
         Self {
             inner,
             ep,
             remote_endpoint_id,
             register_with_socket: None,
+            dial_attempt,
         }
     }
 
@@ -535,13 +541,22 @@ impl Connecting {
     /// [`RecvStream::is_0rtt`]: noq::RecvStream::is_0rtt
     #[allow(clippy::result_large_err)]
     pub fn into_0rtt(self) -> Result<OutgoingZeroRttConnection, Connecting> {
-        match self.inner.into_0rtt() {
+        let Self {
+            inner,
+            register_with_socket,
+            ep,
+            remote_endpoint_id,
+            dial_attempt,
+        } = self;
+        match inner.into_0rtt() {
             Ok((noq_conn, zrtt_accepted)) => {
                 let accepted: BoxFuture<_> = Box::pin({
                     let noq_conn = noq_conn.clone();
                     async move {
+                        // Noq can retransmit the Initial until this handshake completes.
+                        let _dial_attempt = dial_attempt;
                         let accepted = zrtt_accepted.await;
-                        let conn = conn_from_noq_conn(noq_conn, &self.ep)?.await?;
+                        let conn = conn_from_noq_conn(noq_conn, &ep)?.await?;
                         Ok(match accepted {
                             true => ZeroRttStatus::Accepted(conn),
                             false => ZeroRttStatus::Rejected(conn),
@@ -554,7 +569,13 @@ impl Connecting {
                     data: OutgoingZeroRttData { accepted },
                 })
             }
-            Err(inner) => Err(Self { inner, ..self }),
+            Err(inner) => Err(Self {
+                inner,
+                register_with_socket,
+                ep,
+                remote_endpoint_id,
+                dial_attempt,
+            }),
         }
     }
 

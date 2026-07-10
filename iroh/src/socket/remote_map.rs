@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll, Waker, ready},
 };
 
-use iroh_base::{CustomAddr, EndpointAddr, EndpointId, RelayUrl};
+use iroh_base::{CustomAddr, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use n0_future::task::JoinSet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -70,12 +70,88 @@ pub(crate) struct RemoteMap {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MappedAddrs {
-    /// The mapping between [`EndpointId`]s and [`EndpointIdMappedAddr`]s.
-    pub(super) endpoint_addrs: AddrMap<EndpointId, EndpointIdMappedAddr>,
+    /// Maps a unique outgoing dial address to its immutable bootstrap authority.
+    pub(super) endpoint_addrs: AddrMap<BootstrapAuthority, EndpointIdMappedAddr>,
     /// The mapping between endpoints via a relay and their [`RelayMappedAddr`]s.
     pub(super) relay_addrs: AddrMap<(RelayUrl, EndpointId), RelayMappedAddr>,
     /// The mapping between custom transport addresses and their [`CustomMappedAddr`]s.
     pub(super) custom_addrs: AddrMap<CustomAddr, CustomMappedAddr>,
+}
+
+/// Immutable authority for one outgoing connection attempt.
+///
+/// The corresponding unique [`EndpointIdMappedAddr`] is carried by Noq as the attempt token.
+/// Looking it up when an Initial is sent recovers exactly the addresses supplied to that dial.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BootstrapAuthority {
+    endpoint_id: EndpointId,
+    explicit_addrs: Arc<BTreeSet<transports::Addr>>,
+}
+
+impl BootstrapAuthority {
+    pub(crate) fn new(endpoint_id: EndpointId, explicit_addrs: BTreeSet<TransportAddr>) -> Self {
+        let explicit_addrs = explicit_addrs
+            .into_iter()
+            .filter_map(|addr| match addr {
+                TransportAddr::Relay(url) => Some(transports::Addr::from((url, endpoint_id))),
+                TransportAddr::Ip(addr) => Some(transports::Addr::from(addr)),
+                TransportAddr::Custom(addr) => Some(transports::Addr::from(addr)),
+                _ => None,
+            })
+            .collect();
+        Self {
+            endpoint_id,
+            explicit_addrs: Arc::new(explicit_addrs),
+        }
+    }
+
+    pub(super) fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    /// Whether `addr` is a permitted bootstrap path for this attempt and actor.
+    ///
+    /// Relays remain valid bootstrap paths even when discovered after the dial starts. Direct
+    /// and custom paths must be exact members of this attempt's caller-supplied address set.
+    pub(super) fn permits(&self, actor_endpoint_id: EndpointId, addr: &transports::Addr) -> bool {
+        if self.endpoint_id != actor_endpoint_id {
+            return false;
+        }
+        match addr {
+            transports::Addr::Relay(_, endpoint_id) => *endpoint_id == actor_endpoint_id,
+            transports::Addr::Ip(_) | transports::Addr::Custom(_) => {
+                self.explicit_addrs.contains(addr)
+            }
+        }
+    }
+}
+
+/// A resolved outgoing dial whose mapped address keeps its authority registered.
+#[derive(Debug)]
+pub(crate) struct ResolvedRemote {
+    mapped_addr: EndpointIdMappedAddr,
+    endpoint_addrs: AddrMap<BootstrapAuthority, EndpointIdMappedAddr>,
+}
+
+impl ResolvedRemote {
+    pub(crate) fn register(mapped_addrs: &MappedAddrs, authority: BootstrapAuthority) -> Self {
+        let endpoint_addrs = mapped_addrs.endpoint_addrs.clone();
+        let mapped_addr = endpoint_addrs.insert_unique(authority);
+        Self {
+            mapped_addr,
+            endpoint_addrs,
+        }
+    }
+
+    pub(crate) fn mapped_addr(&self) -> EndpointIdMappedAddr {
+        self.mapped_addr
+    }
+}
+
+impl Drop for ResolvedRemote {
+    fn drop(&mut self) {
+        self.endpoint_addrs.remove(&self.mapped_addr);
+    }
 }
 
 /// Converts a mapped socket address to a transport address.
@@ -356,8 +432,6 @@ impl Tasks {
         initial_msgs: Vec<RemoteStateMessage>,
         mapped_addrs: &MappedAddrs,
     ) -> mpsc::Sender<RemoteStateMessage> {
-        // Ensure there is a RemoteMappedAddr for this EndpointId.
-        mapped_addrs.endpoint_addrs.get(&eid);
         let sender = RemoteStateActor::new(
             eid,
             self.local_direct_addrs.clone(),
@@ -438,6 +512,28 @@ mod tests {
         );
         let guards = (watchable, shutdown_token.clone().drop_guard());
         (remote_map, shutdown_token, guards)
+    }
+
+    #[test]
+    fn resolved_remote_unregisters_attempt_authority_on_drop() {
+        let mapped_addrs = MappedAddrs::default();
+        let endpoint_id = SecretKey::from_bytes(&[7; 32]).public();
+        let authority = BootstrapAuthority::new(
+            endpoint_id,
+            BTreeSet::from([TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 4242)))]),
+        );
+
+        let resolved = ResolvedRemote::register(&mapped_addrs, authority.clone());
+        let mapped_addr = resolved.mapped_addr();
+        assert_eq!(mapped_addrs.endpoint_addrs.len(), 1);
+        assert_eq!(
+            mapped_addrs.endpoint_addrs.lookup(&mapped_addr),
+            Some(authority)
+        );
+
+        drop(resolved);
+        assert_eq!(mapped_addrs.endpoint_addrs.len(), 0);
+        assert_eq!(mapped_addrs.endpoint_addrs.lookup(&mapped_addr), None);
     }
 
     /// Regression test: No new RemoteStateActors may be started before
