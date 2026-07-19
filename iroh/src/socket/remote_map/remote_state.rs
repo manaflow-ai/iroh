@@ -513,6 +513,10 @@ impl RemoteStateActor {
                 .state
                 .register_and_configure_path(conn_id, conn_state, &path);
 
+            if let Some(path_remote) = path_remote.as_ref() {
+                conn_state.record_deferred_bootstrap_selection(PathId::ZERO, path_remote);
+            }
+
             if let Some(path_remote) = path_remote
                 && !path_remote.is_relay()
                 && conn.side().is_client()
@@ -837,8 +841,12 @@ impl RemoteStateActor {
                     return;
                 };
 
-                self.state
-                    .register_and_configure_path(conn_id, conn_state, &path);
+                if let Some(path_remote) = self
+                    .state
+                    .register_and_configure_path(conn_id, conn_state, &path)
+                {
+                    conn_state.record_deferred_bootstrap_selection(path_id, &path_remote);
+                }
                 self.select_path();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
@@ -936,14 +944,16 @@ impl RemoteStateActor {
             if !conn_state.nat_traversal_authorized {
                 continue;
             }
-            if self.state.defer_nat_traversal_until_authorized
-                && !conn_state.peer_candidates_observed
-            {
-                continue;
-            }
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
+            if self.state.defer_nat_traversal_until_authorized
+                && !conn_state.peer_candidates_observed
+            {
+                self.state
+                    .apply_existing_selected_path(*conn_id, conn_state, &conn, &selected);
+                continue;
+            }
 
             // Open path if it doesn't exist yet.
             self.state
@@ -1329,6 +1339,29 @@ impl State {
         }
     }
 
+    /// Selects a path Noq has already established without opening any other path.
+    ///
+    /// Before peer candidates reach the actor, applying the normal selection could disclose a
+    /// path learned from another connection. An exact path already open on this connection is
+    /// safe to select after local authorization because it has completed Noq path validation.
+    fn apply_existing_selected_path(
+        &mut self,
+        conn_id: ConnId,
+        conn_state: &ConnectionState,
+        conn: &noq::Connection,
+        selected: &transports::FourTuple,
+    ) {
+        if !conn_state.paths.values().any(|path| path == selected) {
+            return;
+        }
+        for (path_id, path_remote) in &conn_state.paths {
+            if let Some(path) = conn.path(*path_id) {
+                self.set_path_status(conn_id, &path, path_remote);
+            }
+        }
+        conn_state.path_state.record_selected(selected);
+    }
+
     /// Returns the [`transports::FourTuple] for a path.
     fn transport_tuple_for_path(&self, path: &noq::Path) -> Option<transports::FourTuple> {
         let noq_network_path = path.network_path().ok()?;
@@ -1508,6 +1541,21 @@ struct ConnectionState {
 }
 
 impl ConnectionState {
+    /// Publishes the already-active bootstrap path without releasing NAT traversal.
+    ///
+    /// Noq's path zero is the path established by the immutable authority of this exact dial.
+    /// It already carries application data before admission. Recording it as selected only makes
+    /// that existing fact observable; it does not open a path, expose candidates, or holepunch.
+    fn record_deferred_bootstrap_selection(
+        &self,
+        path_id: PathId,
+        network_path: &transports::FourTuple,
+    ) {
+        if !self.nat_traversal_authorized && path_id == PathId::ZERO {
+            self.path_state.record_selected(network_path);
+        }
+    }
+
     /// Tracks an open path for the connection.
     fn add_open_path(
         &mut self,

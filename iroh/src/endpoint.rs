@@ -2545,15 +2545,54 @@ mod tests {
         );
     }
 
+    fn assert_selected_relay(conn: &Connection) {
+        let paths = conn.paths();
+        let selected = paths
+            .iter()
+            .filter(|path| path.is_selected())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            1,
+            "deferred connection must expose its active bootstrap relay as selected: {paths:?}"
+        );
+        assert!(
+            selected[0].is_relay(),
+            "deferred connection selected a non-relay path before authorization: {paths:?}"
+        );
+        assert_eq!(
+            selected[0].id(),
+            noq::PathId::ZERO,
+            "deferred connection selected a discovered path before authorization: {paths:?}"
+        );
+    }
+
+    fn assert_selected_direct(conn: &Connection) {
+        let paths = conn.paths();
+        let selected = paths
+            .iter()
+            .filter(|path| path.is_selected())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            1,
+            "authorized connection must expose exactly one selected path: {paths:?}"
+        );
+        assert!(
+            selected[0].is_ip(),
+            "authorized connection did not select its established direct path: {paths:?}"
+        );
+    }
+
     async fn wait_for_direct(conn: &Connection) -> Result {
         time::timeout(Duration::from_secs(10), async {
             let mut paths = conn.paths_stream();
             while let Some(paths) = paths.next().await {
-                if paths.iter().any(|path| path.is_ip()) {
+                if paths.iter().any(|path| path.is_ip() && path.is_selected()) {
                     return;
                 }
             }
-            panic!("connection closed before establishing a direct path");
+            panic!("connection closed before selecting a direct path");
         })
         .await
         .anyerr()?;
@@ -2636,6 +2675,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_relay_only(&client_conn);
         assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
         #[cfg(feature = "metrics")]
         {
             assert_eq!(client.metrics().socket.holepunch_attempts.get(), 0);
@@ -2648,12 +2689,16 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(250)).await;
         assert_relay_only(&client_conn);
         assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
 
         client_conn.authorize_nat_traversal().await?;
         exchange_final_admission_ack(&client_conn, &server_conn).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert_relay_only(&client_conn);
         assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
         server_conn.authorize_nat_traversal().await?;
         wait_for_direct(&client_conn)
             .await
@@ -2661,6 +2706,8 @@ mod tests {
         wait_for_direct(&server_conn)
             .await
             .std_context("server did not migrate after authorization")?;
+        assert_selected_direct(&client_conn);
+        assert_selected_direct(&server_conn);
         #[cfg(feature = "metrics")]
         assert!(client.metrics().socket.holepunch_attempts.get() > 0);
 
