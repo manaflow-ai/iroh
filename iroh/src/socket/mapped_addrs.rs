@@ -88,7 +88,7 @@ pub(crate) trait MappedAddr {
 /// address is even supported on this platform.  Hence no wasm exceptions here.
 #[derive(Clone, Debug)]
 pub(crate) enum MultipathMappedAddr {
-    /// An address for a [`crate::EndpointId`], via one or more paths.
+    /// An address for one outgoing dial to a [`crate::EndpointId`], via one or more paths.
     Mixed(EndpointIdMappedAddr),
     /// An address for a particular [`crate::EndpointId`] via a particular relay.
     Relay(RelayMappedAddr),
@@ -118,16 +118,16 @@ impl From<SocketAddr> for MultipathMappedAddr {
     }
 }
 
-/// An address used to address a endpoint on any or all paths.
+/// An address used to identify one outgoing dial on any or all permitted paths.
 ///
-/// This is only used for initially connecting to a remote endpoint.  We instruct Noq to
-/// send to this address, and duplicate all packets for this address to send on all paths we
-/// might want to send the initial on:
+/// This is only used for initially connecting to a remote endpoint. We instruct Noq to send to
+/// this address, then recover both the endpoint and immutable bootstrap authority for that exact
+/// dial before duplicating its Initial onto permitted paths:
 ///
-/// - If this the first connection to the remote endpoint we don't know which path will work
-///   and send to all of them.
+/// - If this is the first connection to the remote endpoint we don't know which permitted path
+///   will work and send to all of them.
 ///
-/// - If there already is an active connection to this endpoint we now which path to use.
+/// - If there already is an active connection to this endpoint we know which path to use.
 ///
 /// It is but a newtype around an IPv6 Unique Local Addr.  And in our QUIC-facing socket
 /// APIs like [`noq::AsyncUdpSocket`] it comes in as the inner [`Ipv6Addr`], in those
@@ -151,7 +151,7 @@ impl MappedAddr for EndpointIdMappedAddr {
         Self(Ipv6Addr::from(addr))
     }
 
-    /// Returns a consistent [`SocketAddr`] for the [`EndpointIdMappedAddr`].
+    /// Returns a consistent [`SocketAddr`] for this [`EndpointIdMappedAddr`].
     ///
     /// This socket address does not have a routable IP address and port.
     ///
@@ -359,10 +359,40 @@ where
         }
     }
 
+    /// Generates a fresh mapped address for `key`, even if the key was registered before.
+    ///
+    /// This is used when the mapped address is itself an unforgeable correlation token for
+    /// one operation. Unlike [`Self::get`], it deliberately has no forward-map entry because
+    /// a later operation with the same key must receive a different address.
+    pub(super) fn insert_unique(&self, key: K) -> V {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let addr = V::generate();
+        inner.lookup.insert(addr, key.clone());
+        trace!(?addr, ?key, "generated new unique addr");
+        addr
+    }
+
     /// Performs the reverse lookup.
     pub(super) fn lookup(&self, addr: &V) -> Option<K> {
         let inner = self.inner.lock().expect("poisoned");
         inner.lookup.get(addr).cloned()
+    }
+
+    /// Removes a mapped address and, when applicable, its matching forward-map entry.
+    pub(super) fn remove(&self, addr: &V) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let Some(key) = inner.lookup.remove(addr) else {
+            return;
+        };
+        if inner.addrs.get(&key) == Some(addr) {
+            inner.addrs.remove(&key);
+        }
+        trace!(?addr, ?key, "removed mapped addr");
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        self.inner.lock().expect("poisoned").lookup.len()
     }
 }
 

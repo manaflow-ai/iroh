@@ -69,7 +69,8 @@ use crate::{
     address_lookup::{self, AddressLookupFailed, EndpointData, UserData},
     defaults::timeouts::NET_REPORT_TIMEOUT,
     endpoint::{
-        LocalTransportAddr, RelayStatus, hooks::EndpointHooksList, quic::QuicTransportConfig,
+        LocalTransportAddr, NatTraversalAuthorizationError, RelayStatus, hooks::EndpointHooksList,
+        quic::QuicTransportConfig,
     },
     metrics::EndpointMetrics,
     net_report::{self, IfStateDetails, Report},
@@ -77,7 +78,10 @@ use crate::{
     runtime::Runtime,
     socket::{
         concurrent_read_map::ReadOnlyMap,
-        remote_map::{MappedAddrs, PathSelector, PathStateReceiver, RemoteInfo},
+        remote_map::{
+            BootstrapAuthority, MappedAddrs, PathSelector, PathStateReceiver, RemoteInfo,
+            ResolvedRemote,
+        },
         transports::{HomeRelayWatch, HomeRelayWatcher},
     },
     tls::{
@@ -94,7 +98,7 @@ pub(crate) mod mapped_addrs;
 pub(crate) mod remote_map;
 pub(crate) mod transports;
 
-use self::mapped_addrs::{EndpointIdMappedAddr, MappedAddr};
+use self::mapped_addrs::MappedAddr;
 pub use self::metrics::Metrics;
 
 // TODO: Use this
@@ -154,6 +158,32 @@ impl From<mpsc::error::SendError<RemoteStateMessage>> for RemoteStateActorStoppe
     #[track_caller]
     fn from(_value: mpsc::error::SendError<RemoteStateMessage>) -> Self {
         Self::new()
+    }
+}
+
+/// Exact-connection handle used to authorize NAT traversal through the owning actors.
+#[derive(Debug, Clone)]
+pub(crate) struct NatTraversalAuthorizer {
+    actor_sender: mpsc::Sender<ActorMessage>,
+    remote: EndpointId,
+    connection_id: usize,
+}
+
+impl NatTraversalAuthorizer {
+    pub(crate) async fn authorize(&self) -> Result<(), NatTraversalAuthorizationError> {
+        let (tx, rx) = oneshot::channel();
+        self.actor_sender
+            .send(ActorMessage::AuthorizeNatTraversal {
+                remote: self.remote,
+                connection_id: self.connection_id,
+                reply: tx,
+            })
+            .await
+            .map_err(|_| NatTraversalAuthorizationError::new())?;
+        match rx.await {
+            Ok(true) => Ok(()),
+            Ok(false) | Err(_) => Err(NatTraversalAuthorizationError::new()),
+        }
     }
 }
 
@@ -242,6 +272,7 @@ pub(crate) struct StaticConfig {
     #[debug("Arc<dyn TokenStore>")]
     pub(crate) token_store: Arc<dyn TokenStore>,
     pub(crate) transport_config: QuicTransportConfig,
+    pub(crate) defer_nat_traversal_until_authorized: bool,
 }
 
 impl StaticConfig {
@@ -981,6 +1012,7 @@ impl EndpointInner {
                 address_lookup.clone(),
                 shutdown_token.child_token(),
                 path_selector,
+                static_config.defer_nat_traversal_until_authorized,
                 span.clone(),
             )
         };
@@ -1323,15 +1355,17 @@ impl EndpointInner {
             .ok();
     }
 
-    /// Resolves an [`EndpointAddr`] to an [`EndpointIdMappedAddr`] to connect to via [`EndpointInner::endpoint`].
+    /// Resolves an [`EndpointAddr`] to a unique outgoing dial token.
     ///
     /// This starts a `RemoteStateActor` for the remote if not running already, and then checks
     /// if the actor has any known paths to the remote. If not, it starts address lookup and waits for
     /// at least one result to arrive.
     ///
-    /// Returns `Ok(Ok(EndpointIdMappedAddr))` if there is a known path or Address Lookup produced
-    /// at least one result. This does not mean there is a working path, only that we have at least
-    /// one transport address we can try to connect to.
+    /// Returns `Ok(Ok(ResolvedRemote))` if there is a known path or Address Lookup produced at
+    /// least one result. Its mapped address identifies this exact dial and keeps the immutable
+    /// bootstrap authority registered until the connection attempt completes or is dropped. This
+    /// does not mean there is a working path, only that we have at least one transport address we
+    /// can try to connect to.
     ///
     /// Returns `Ok(Err(address_lookup_error))` if there are no known paths to the remote and Address Lookup
     /// failed or produced no results. This means that we don't have any transport address for
@@ -1342,19 +1376,19 @@ impl EndpointInner {
     pub(crate) async fn resolve_remote(
         &self,
         addr: EndpointAddr,
-    ) -> Result<Result<EndpointIdMappedAddr, AddressLookupFailed>, RemoteStateActorStoppedError>
-    {
+    ) -> Result<Result<ResolvedRemote, AddressLookupFailed>, RemoteStateActorStoppedError> {
         let (tx, rx) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let _cancel_on_drop = cancellation.clone().drop_guard();
         let remote_id = addr.id;
+        let authority = BootstrapAuthority::new(remote_id, addr.addrs.clone());
         self.actor_sender
             .send(ActorMessage::ResolveRemote(addr, tx, cancellation))
             .await
             .ok();
         let reply = rx.await.map_err(|_| RemoteStateActorStoppedError::new())?;
         match reply {
-            Ok(()) => Ok(Ok(self.mapped_addrs.endpoint_addrs.get(&remote_id))),
+            Ok(()) => Ok(Ok(ResolvedRemote::register(&self.mapped_addrs, authority))),
             Err(err) => Ok(Err(err)),
         }
     }
@@ -1377,23 +1411,31 @@ impl EndpointInner {
     /// The actor is responsible for holepunching and opening additional paths to this
     /// connection.
     ///
-    /// Returns a future that resolves to a [`PathStateReceiver`] for the new connection.
+    /// Returns the path observer and exact-connection NAT traversal authorizer.
     ///
     /// The returned future is `'static`, so it can be stored without being lifetime-bound to `&self`.
     pub(crate) fn register_connection(
         &self,
         remote: EndpointId,
         conn: noq::Connection,
-    ) -> impl Future<Output = Result<PathStateReceiver, RemoteStateActorStoppedError>> + Send + 'static
-    {
+    ) -> impl Future<
+        Output = Result<(PathStateReceiver, NatTraversalAuthorizer), RemoteStateActorStoppedError>,
+    > + Send
+    + 'static {
         let (tx, rx) = oneshot::channel();
         let sender = self.actor_sender.clone();
+        let authorizer = NatTraversalAuthorizer {
+            actor_sender: sender.clone(),
+            remote,
+            connection_id: conn.stable_id(),
+        };
         async move {
             sender
                 .send(ActorMessage::AddConnection(remote, conn, tx))
                 .await
                 .map_err(|_| RemoteStateActorStoppedError::new())?;
-            rx.await.map_err(|_| RemoteStateActorStoppedError::new())
+            let paths = rx.await.map_err(|_| RemoteStateActorStoppedError::new())?;
+            Ok((paths, authorizer))
         }
     }
 }
@@ -1419,6 +1461,12 @@ enum ActorMessage {
         noq::Connection,
         oneshot::Sender<PathStateReceiver>,
     ),
+    #[debug("AuthorizeNatTraversal(remote={remote}, connection_id={connection_id})")]
+    AuthorizeNatTraversal {
+        remote: EndpointId,
+        connection_id: usize,
+        reply: oneshot::Sender<bool>,
+    },
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
     DirectAddrRefresh,
     #[cfg(all(test, with_crypto_provider))]
@@ -1824,6 +1872,15 @@ impl Actor {
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;
             }
+            ActorMessage::AuthorizeNatTraversal {
+                remote,
+                connection_id,
+                reply,
+            } => {
+                self.remote_map
+                    .authorize_nat_traversal(remote, connection_id, reply)
+                    .await;
+            }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]
                 {
@@ -2198,6 +2255,7 @@ mod tests {
             token_key: Arc::new(RustlsTokenKey::new(rng, &crypto_provider).unwrap()),
             token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
+            defer_nat_traversal_until_authorized: false,
         };
         let server_config = static_config.create_server_config(vec![]);
         Options {
@@ -2613,6 +2671,7 @@ mod tests {
             token_key: Arc::new(RustlsTokenKey::new(&mut rand::rng(), &crypto_provider).unwrap()),
             token_store: Arc::new(noq::TokenMemoryCache::default()),
             transport_config: QuicTransportConfig::default(),
+            defer_nat_traversal_until_authorized: false,
         };
         let server_config = static_config.create_server_config(vec![ALPN.to_vec()]);
 
@@ -2777,7 +2836,7 @@ mod tests {
             socket_connect(
                 sock_1.noq_endpoint().clone(),
                 secret_key_1.clone(),
-                addr,
+                addr.mapped_addr(),
                 endpoint_id_2,
             ),
         )
@@ -2857,13 +2916,14 @@ mod tests {
         let res = socket_connect_with_transport_config(
             sock_1.noq_endpoint().clone(),
             secret_key_1.clone(),
-            addr_2,
+            addr_2.mapped_addr(),
             endpoint_id_2,
             Arc::new(transport_config),
         )
         .await;
         assert!(res.is_err(), "expected timeout");
         info!("first connect timed out as expected");
+        drop(addr_2);
 
         // Provide correct addressing information
         let correct_addr_2 = EndpointAddr::from_parts(
@@ -2879,15 +2939,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(addr_2, addr_2a);
-
         // We can now connect
         tokio::time::timeout(Duration::from_secs(10), async move {
             info!("establishing new connection");
             let conn = socket_connect(
                 sock_1.noq_endpoint().clone(),
                 secret_key_1.clone(),
-                addr_2,
+                addr_2a.mapped_addr(),
                 endpoint_id_2,
             )
             .await
