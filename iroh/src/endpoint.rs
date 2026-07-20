@@ -1007,9 +1007,10 @@ impl Endpoint {
     /// Adds the provided configuration to the [`RelayMap`].
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
-    /// If a client for this relay is active, it is restarted with the new
-    /// connection-scoped configuration (including its auth token). The
-    /// endpoint identity and existing QUIC connections are retained.
+    /// An active client keeps its established relay route. Updated
+    /// connection-scoped configuration (including its auth token) is used on
+    /// the next relay dial, retaining endpoint identity and existing QUIC
+    /// connections across credential refresh.
     ///
     /// Will also return `None` if the endpoint is closed.
     pub async fn insert_relay(
@@ -4728,7 +4729,8 @@ mod tests {
             expected: expected.clone(),
             observed: observed_tx,
         });
-        let (_relay_map, relay_url, _guard) = run_relay_server_with_access(false, access).await?;
+        let (_relay_map, relay_url, relay_server) =
+            run_relay_server_with_access(false, access).await?;
         let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
             .with_auth_token(TOKEN_A)
             .into();
@@ -4793,6 +4795,14 @@ mod tests {
                 Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
             )
             .await;
+
+        assert!(
+            relay_server
+                .relay_service()
+                .expect("relay service")
+                .clients()
+                .disconnect(client.id(), None)
+        );
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(token) = observed_rx.recv().await {
@@ -4868,6 +4878,7 @@ mod tests {
         let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
         let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
         let replacement_gate = Arc::new(Notify::new());
+        let (client_done_tx, client_done_rx) = oneshot::channel();
         let access = Arc::new(DelayedRotatingTokenAccess {
             expected: expected.clone(),
             observed: observed_tx,
@@ -4905,13 +4916,18 @@ mod tests {
             tokio::spawn(async move {
                 let connection = server.accept().await.anyerr()?.await.anyerr()?;
                 let (mut send, mut recv) = connection.accept_bi().await.anyerr()?;
-                for expected in [b"before".as_slice(), b"during".as_slice(), b"after".as_slice()] {
+                for expected in [
+                    b"before".as_slice(),
+                    b"during".as_slice(),
+                    b"after".as_slice(),
+                ] {
                     let mut received = vec![0; expected.len()];
                     recv.read_exact(&mut received).await.anyerr()?;
                     assert_eq!(received, expected);
                     send.write_all(&received).await.anyerr()?;
                 }
-                send.finish().anyerr()?;
+                let _ = send.finish();
+                let _ = client_done_rx.await;
                 Ok(())
             })
         };
@@ -4947,13 +4963,10 @@ mod tests {
 
         send.write_all(b"during").await.anyerr()?;
         let mut echoed_during = [0; 6];
-        tokio::time::timeout(
-            Duration::from_secs(1),
-            recv.read_exact(&mut echoed_during),
-        )
-        .await
-        .std_context("receiver disappeared while replacement relay auth was pending")?
-        .anyerr()?;
+        tokio::time::timeout(Duration::from_secs(1), recv.read_exact(&mut echoed_during))
+            .await
+            .std_context("receiver disappeared while replacement relay auth was pending")?
+            .anyerr()?;
         assert_eq!(&echoed_during, b"during");
 
         // Simulate relay-side JWT expiry. The active actor must reconnect
@@ -4983,10 +4996,11 @@ mod tests {
         assert_eq!(connection.stable_id(), connection_id);
         assert_eq!(connection.close_reason(), None);
         send.write_all(b"after").await.anyerr()?;
-        send.finish().anyerr()?;
+        let _ = send.finish();
         let mut echoed_after = [0; 5];
         recv.read_exact(&mut echoed_after).await.anyerr()?;
         assert_eq!(&echoed_after, b"after");
+        let _ = client_done_tx.send(());
 
         server_task.await.anyerr()??;
         client.close().await;
