@@ -658,9 +658,10 @@ pub(crate) struct NetworkChangeSender {
 }
 
 impl NetworkChangeSender {
-    /// Apply a relay-map change to each relay transport. This waits until any
-    /// active actor for the URL has been stopped and, for an upsert, replaced
-    /// with one built from the new configuration.
+    /// Apply a relay-map change to each relay transport. An upsert preserves
+    /// an established actor for the URL so its next dial reads the new
+    /// configuration; a closed actor may be removed and recreated. Removing
+    /// the URL stops its actor.
     pub(crate) async fn relay_config_changed(&self, relay_url: RelayUrl, present: bool) {
         for relay in &self.relay {
             relay.relay_config_changed(relay_url.clone(), present).await;
