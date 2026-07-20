@@ -12,7 +12,7 @@ use n0_future::{
     task::{self, AbortOnDropHandle},
 };
 use n0_watcher::Watcher as _;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::{CancellationToken, PollSender};
 use tracing::{Instrument, error, info_span, warn};
 
@@ -217,6 +217,22 @@ pub(super) struct RelayNetworkChangeSender {
 }
 
 impl RelayNetworkChangeSender {
+    pub(super) async fn relay_config_changed(&self, url: RelayUrl, present: bool) {
+        let (done_tx, done_rx) = oneshot::channel();
+        if self
+            .sender
+            .send(RelayActorMessage::RelayConfigChanged {
+                url,
+                present,
+                done: done_tx,
+            })
+            .await
+            .is_ok()
+        {
+            let _ = done_rx.await;
+        }
+    }
+
     pub(super) fn on_network_change(&self, report: &crate::socket::Report) {
         self.send_relay_actor(RelayActorMessage::NetworkChange {
             report: report.clone(),

@@ -97,8 +97,9 @@ pub use self::{
     connection::{
         Accept, Accepting, AlpnError, AuthenticationError, Connecting, ConnectingError, Connection,
         ConnectionState, HandshakeCompleted, Incoming, IncomingAddr, IncomingZeroRtt,
-        IncomingZeroRttConnection, OutgoingZeroRtt, OutgoingZeroRttConnection,
-        RemoteEndpointIdError, RetryError, WeakConnectionHandle, ZeroRttStatus,
+        IncomingZeroRttConnection, NatTraversalAuthorizationError, OutgoingZeroRtt,
+        OutgoingZeroRttConnection, RemoteEndpointIdError, RetryError, WeakConnectionHandle,
+        ZeroRttStatus,
     },
     quic::{
         AcceptBi, AcceptUni, AckFrequencyConfig, ApplicationClose, Chunk, Closed, ClosedStream,
@@ -130,6 +131,7 @@ pub struct Builder {
     secret_key: Option<SecretKey>,
     alpn_protocols: Vec<Vec<u8>>,
     transport_config: QuicTransportConfig,
+    defer_nat_traversal_until_authorized: bool,
     keylog: bool,
     address_lookup: Vec<Box<dyn DynAddressLookupBuilder>>,
     address_lookup_user_data: Option<UserData>,
@@ -200,6 +202,7 @@ impl Builder {
             secret_key: Default::default(),
             alpn_protocols: Default::default(),
             transport_config: QuicTransportConfig::default(),
+            defer_nat_traversal_until_authorized: false,
             keylog: Default::default(),
             address_lookup: Default::default(),
             address_lookup_user_data: Default::default(),
@@ -242,11 +245,15 @@ impl Builder {
             self.max_tls_tickets,
             crypto_provider.clone(),
         );
+        let transport_config = self
+            .transport_config
+            .with_deferred_nat_traversal(self.defer_nat_traversal_until_authorized);
         let static_config = StaticConfig {
             server_config: tls_config.make_server_config(self.keylog)?,
             client_config: tls_config.make_client_config(self.keylog)?,
             tls_config,
-            transport_config: self.transport_config.clone(),
+            transport_config,
+            defer_nat_traversal_until_authorized: self.defer_nat_traversal_until_authorized,
             token_key,
             token_store: Arc::new(noq::TokenMemoryCache::default()),
         };
@@ -671,6 +678,19 @@ impl Builder {
         self
     }
 
+    /// Defers NAT traversal for every connection until the application authorizes it.
+    ///
+    /// When enabled, a connection may establish over a relay or an explicitly supplied
+    /// direct address, but the endpoint does not advertise local candidates, react to
+    /// remote candidates, probe, or migrate to another direct path until
+    /// [`Connection::authorize_nat_traversal`] succeeds for that exact connection.
+    ///
+    /// This is disabled by default.
+    pub fn defer_nat_traversal_until_authorized(mut self, defer: bool) -> Self {
+        self.defer_nat_traversal_until_authorized = defer;
+        self
+    }
+
     /// Optionally sets a custom DNS resolver to use for this endpoint.
     ///
     /// The DNS resolver is used to resolve relay hostnames, and endpoint addresses if
@@ -977,6 +997,10 @@ impl Endpoint {
     /// Adds the provided configuration to the [`RelayMap`].
     ///
     /// Replacing and returning any existing configuration for [`RelayUrl`].
+    /// An active client keeps its established relay route. Updated
+    /// connection-scoped configuration (including its auth token) is used on
+    /// the next relay dial, retaining endpoint identity and existing QUIC
+    /// connections across credential refresh.
     ///
     /// Will also return `None` if the endpoint is closed.
     pub async fn insert_relay(
@@ -1124,12 +1148,17 @@ impl Endpoint {
             "connecting",
         );
 
-        let mapped_addr = self.inner.resolve_remote(endpoint_addr).await??;
+        let resolved_remote = self.inner.resolve_remote(endpoint_addr).await??;
 
         let transport_config = options
             .transport_config
-            .map(|cfg| cfg.to_inner_arc())
-            .unwrap_or(self.inner.static_config.transport_config.to_inner_arc());
+            .unwrap_or_else(|| self.inner.static_config.transport_config.clone())
+            .with_deferred_nat_traversal(
+                self.inner
+                    .static_config
+                    .defer_nat_traversal_until_authorized,
+            )
+            .to_inner_arc();
 
         // Start connecting via noq. This will time out after 10 seconds if no reachable
         // address is available.
@@ -1141,14 +1170,19 @@ impl Endpoint {
             .static_config
             .create_client_config(alpn_protocols, transport_config.clone());
 
-        let dest_addr = mapped_addr.private_socket_addr();
+        let dest_addr = resolved_remote.mapped_addr().private_socket_addr();
         let server_name = &tls::name::encode(endpoint_id);
         let connect =
             self.inner
                 .noq_endpoint()
                 .connect_with(client_config, dest_addr, server_name)?;
 
-        Ok(Connecting::new(connect, self.clone(), endpoint_id))
+        Ok(Connecting::new(
+            connect,
+            self.clone(),
+            endpoint_id,
+            resolved_remote,
+        ))
     }
 
     /// Accepts an incoming connection on the endpoint.
@@ -1998,7 +2032,7 @@ mod tests {
         io,
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4},
         str::FromStr,
-        sync::Arc,
+        sync::{Arc, RwLock},
         time::{Duration, Instant},
     };
 
@@ -2012,7 +2046,7 @@ mod tests {
     use noq::PathStats;
     use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, mpsc, oneshot};
     use tracing::{Instrument, debug_span, error_span, info, info_span, instrument};
 
     use super::Endpoint;
@@ -2024,9 +2058,11 @@ mod tests {
             ConnectWithOptsError, Connection, ConnectionError, PathEvent, PathEventStream, presets,
         },
         protocol::{AcceptError, ProtocolHandler, Router},
+        socket::{mapped_addrs::MappedAddr, remote_map::ResolvedRemote},
         test_utils::{
             QlogFileGroup, run_relay_server, run_relay_server_with, run_relay_server_with_access,
         },
+        tls,
     };
 
     const TEST_ALPN: &[u8] = b"n0/iroh/test";
@@ -2495,6 +2531,444 @@ mod tests {
             ConnectionError::ApplicationClosed(ApplicationClose { .. })
         ));
 
+        Ok(())
+    }
+
+    fn assert_relay_only(conn: &Connection) {
+        let paths = conn.paths();
+        assert!(
+            !paths.is_empty(),
+            "connection must retain its bootstrap path"
+        );
+        assert!(
+            paths.iter().all(|path| path.is_relay()),
+            "deferred connection opened a non-relay path before authorization: {paths:?}"
+        );
+    }
+
+    fn assert_selected_relay(conn: &Connection) {
+        let paths = conn.paths();
+        let selected = paths
+            .iter()
+            .filter(|path| path.is_selected())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            1,
+            "deferred connection must expose its active bootstrap relay as selected: {paths:?}"
+        );
+        assert!(
+            selected[0].is_relay(),
+            "deferred connection selected a non-relay path before authorization: {paths:?}"
+        );
+        assert_eq!(
+            selected[0].id(),
+            noq::PathId::ZERO,
+            "deferred connection selected a discovered path before authorization: {paths:?}"
+        );
+    }
+
+    fn assert_selected_direct(conn: &Connection) {
+        let paths = conn.paths();
+        let selected = paths
+            .iter()
+            .filter(|path| path.is_selected())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            selected.len(),
+            1,
+            "authorized connection must expose exactly one selected path: {paths:?}"
+        );
+        assert!(
+            selected[0].is_ip(),
+            "authorized connection did not select its established direct path: {paths:?}"
+        );
+    }
+
+    async fn wait_for_direct(conn: &Connection) -> Result {
+        time::timeout(Duration::from_secs(10), async {
+            let mut paths = conn.paths_stream();
+            while let Some(paths) = paths.next().await {
+                if paths.iter().any(|path| path.is_ip() && path.is_selected()) {
+                    return;
+                }
+            }
+            panic!("connection closed before selecting a direct path");
+        })
+        .await
+        .anyerr()?;
+        Ok(())
+    }
+
+    async fn exchange_pre_admission_control_stream(
+        client: &Connection,
+        server: &Connection,
+    ) -> Result {
+        let send = async {
+            let (mut send, mut recv) = client.open_bi().await.anyerr()?;
+            send.write_all(b"admission").await.anyerr()?;
+            send.finish().anyerr()?;
+            let reply = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(reply, b"accepted");
+            Ok::<_, Error>(())
+        };
+        let receive = async {
+            let (mut send, mut recv) = server.accept_bi().await.anyerr()?;
+            let request = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(request, b"admission");
+            send.write_all(b"accepted").await.anyerr()?;
+            send.finish().anyerr()?;
+            Ok::<_, Error>(())
+        };
+        tokio::try_join!(send, receive)?;
+        Ok(())
+    }
+
+    async fn exchange_final_admission_ack(client: &Connection, server: &Connection) -> Result {
+        let send = async {
+            let mut send = client.open_uni().await.anyerr()?;
+            send.write_all(b"admission-ack").await.anyerr()?;
+            send.finish().anyerr()?;
+            Ok::<_, Error>(())
+        };
+        let receive = async {
+            let mut recv = server.accept_uni().await.anyerr()?;
+            let ack = recv.read_to_end(32).await.anyerr()?;
+            assert_eq!(ack, b"admission-ack");
+            Ok::<_, Error>(())
+        };
+        tokio::try_join!(send, receive)?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_waits_for_exact_connection_authorization() -> Result {
+        let (relay_map, relay_url, _relay_guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        tokio::join!(server.online(), client.online());
+
+        let server_id = server.id();
+        let client_id = client.id();
+        let server_addr = EndpointAddr::new(server_id).with_relay_url(relay_url);
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let client_conn = client.connect(server_addr, TEST_ALPN).await?;
+        let server_conn = accept.await.anyerr()??;
+        let client_conn_id = client_conn.stable_id();
+        let server_conn_id = server_conn.stable_id();
+
+        exchange_pre_admission_control_stream(&client_conn, &server_conn).await?;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
+        #[cfg(feature = "metrics")]
+        {
+            assert_eq!(client.metrics().socket.holepunch_attempts.get(), 0);
+            assert_eq!(server.metrics().socket.holepunch_attempts.get(), 0);
+        }
+
+        let churn_addr: SocketAddr = "198.51.100.10:4242".parse().expect("valid test address");
+        client.add_external_addr(churn_addr).await;
+        assert!(client.remove_external_addr(&churn_addr).await);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
+
+        client_conn.authorize_nat_traversal().await?;
+        exchange_final_admission_ack(&client_conn, &server_conn).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_relay_only(&client_conn);
+        assert_relay_only(&server_conn);
+        assert_selected_relay(&client_conn);
+        assert_selected_relay(&server_conn);
+        server_conn.authorize_nat_traversal().await?;
+        wait_for_direct(&client_conn)
+            .await
+            .std_context("client did not migrate after authorization")?;
+        wait_for_direct(&server_conn)
+            .await
+            .std_context("server did not migrate after authorization")?;
+        assert_selected_direct(&client_conn);
+        assert_selected_direct(&server_conn);
+        #[cfg(feature = "metrics")]
+        assert!(client.metrics().socket.holepunch_attempts.get() > 0);
+
+        #[cfg(feature = "metrics")]
+        let attempts_before_idempotent_call = (
+            client.metrics().socket.holepunch_attempts.get(),
+            server.metrics().socket.holepunch_attempts.get(),
+        );
+        client_conn.authorize_nat_traversal().await?;
+        server_conn.authorize_nat_traversal().await?;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        #[cfg(feature = "metrics")]
+        assert_eq!(
+            attempts_before_idempotent_call,
+            (
+                client.metrics().socket.holepunch_attempts.get(),
+                server.metrics().socket.holepunch_attempts.get(),
+            ),
+            "idempotent authorization started another NAT traversal round"
+        );
+
+        assert_eq!(
+            client.id(),
+            client_id,
+            "authorization recreated the client endpoint"
+        );
+        assert_eq!(
+            server.id(),
+            server_id,
+            "authorization recreated the server endpoint"
+        );
+        assert_eq!(client_conn.stable_id(), client_conn_id);
+        assert_eq!(server_conn.stable_id(), server_conn_id);
+
+        let churn_addr: SocketAddr = "198.51.100.11:4243".parse().expect("valid test address");
+        server.add_external_addr(churn_addr).await;
+        assert!(server.remove_external_addr(&churn_addr).await);
+        wait_for_direct(&client_conn)
+            .await
+            .std_context("client lost its direct path after candidate churn")?;
+        wait_for_direct(&server_conn)
+            .await
+            .std_context("server lost its direct path after candidate churn")?;
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_does_not_authorize_reconnect_from_cached_path() -> Result {
+        let (relay_map, relay_url, _relay_guard) = run_relay_server().await?;
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map.clone()))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Custom(relay_map))
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        tokio::join!(server.online(), client.online());
+        let relay_addr = EndpointAddr::new(server.id()).with_relay_url(relay_url);
+
+        let accept_first = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let first_client = client.connect(relay_addr.clone(), TEST_ALPN).await?;
+        let first_server = accept_first.await.anyerr()??;
+        first_client.authorize_nat_traversal().await?;
+        exchange_final_admission_ack(&first_client, &first_server).await?;
+        first_server.authorize_nat_traversal().await?;
+        wait_for_direct(&first_client)
+            .await
+            .std_context("first client connection did not migrate")?;
+        wait_for_direct(&first_server)
+            .await
+            .std_context("first server connection did not migrate")?;
+
+        let accept_second = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let second_client = client.connect(relay_addr, TEST_ALPN).await?;
+        let second_server = accept_second.await.anyerr()??;
+        assert_ne!(first_client.stable_id(), second_client.stable_id());
+        assert_ne!(first_server.stable_id(), second_server.stable_id());
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+
+        // Re-authorizing the first connection and changing candidates must not
+        // authorize another connection to the same EndpointId.
+        first_client.authorize_nat_traversal().await?;
+        first_server.authorize_nat_traversal().await?;
+        let churn_addr: SocketAddr = "198.51.100.12:4244".parse().expect("valid test address");
+        client.add_external_addr(churn_addr).await;
+        assert!(client.remove_external_addr(&churn_addr).await);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+
+        second_client.authorize_nat_traversal().await?;
+        exchange_final_admission_ack(&second_client, &second_server).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_relay_only(&second_client);
+        assert_relay_only(&second_server);
+        second_server.authorize_nat_traversal().await?;
+        wait_for_direct(&second_client)
+            .await
+            .std_context("second client connection did not migrate")?;
+        wait_for_direct(&second_server)
+            .await
+            .std_context("second server connection did not migrate")?;
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_allows_explicit_initial_direct_path() -> Result {
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move { server.accept().await.anyerr()?.await.anyerr() }
+        });
+        let client_conn = client.connect(server.addr(), TEST_ALPN).await?;
+        let server_conn = accept.await.anyerr()??;
+
+        exchange_pre_admission_control_stream(&client_conn, &server_conn).await?;
+        assert!(client_conn.paths().iter().any(|path| path.is_ip()));
+        assert!(server_conn.paths().iter().any(|path| path.is_ip()));
+
+        client_conn.close(0u32.into(), b"test complete");
+        assert!(
+            client_conn.authorize_nat_traversal().await.is_err(),
+            "a closed connection must fail NAT traversal authorization"
+        );
+
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn deferred_nat_traversal_scopes_explicit_bootstrap_paths_to_each_dial() -> Result {
+        const ALPN_A: &[u8] = b"n0/iroh/bootstrap-attempt-a";
+        const ALPN_B: &[u8] = b"n0/iroh/bootstrap-attempt-b";
+
+        let server_secret = SecretKey::from_bytes(&[42; 32]);
+        let server_id = server_secret.public();
+        let make_server = || {
+            Endpoint::builder(presets::Minimal)
+                .secret_key(server_secret.clone())
+                .alpns(vec![ALPN_A.to_vec(), ALPN_B.to_vec()])
+                .relay_mode(RelayMode::Disabled)
+                .clear_ip_transports()
+                .bind_addr((Ipv4Addr::LOCALHOST, 0))
+        };
+        let server_a = make_server()?.bind().await?;
+        let server_b = make_server()?.bind().await?;
+        let server_a_addr = *server_a
+            .addr()
+            .ip_addrs()
+            .next()
+            .expect("server A must publish its explicit loopback address");
+        let server_b_addr = *server_b
+            .addr()
+            .ip_addrs()
+            .next()
+            .expect("server B must publish its explicit loopback address");
+        assert_ne!(server_a_addr, server_b_addr);
+
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .defer_nat_traversal_until_authorized(true)
+            .bind()
+            .await?;
+        let inner = client.inner()?;
+
+        // Resolve both dials before starting either QUIC connection. They target the same
+        // authenticated EndpointId but carry disjoint, caller-supplied bootstrap addresses.
+        // The two returned mapped addresses pause and identify the attempts until Noq sends
+        // their Initials below.
+        let resolved_a = inner
+            .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_a_addr))
+            .await
+            .anyerr()??;
+        let resolved_b = inner
+            .resolve_remote(EndpointAddr::new(server_id).with_ip_addr(server_b_addr))
+            .await
+            .anyerr()??;
+
+        let start_dial = |resolved: &ResolvedRemote, alpn: &[u8]| {
+            let transport_config = inner
+                .static_config
+                .transport_config
+                .clone()
+                .with_deferred_nat_traversal(true)
+                .to_inner_arc();
+            let client_config = inner
+                .static_config
+                .create_client_config(vec![alpn.to_vec()], transport_config);
+            inner.noq_endpoint().connect_with(
+                client_config,
+                resolved.mapped_addr().private_socket_addr(),
+                &tls::name::encode(server_id),
+            )
+        };
+        let dial_a = start_dial(&resolved_a, ALPN_A).anyerr()?;
+        let dial_b = start_dial(&resolved_b, ALPN_B).anyerr()?;
+
+        let (server_conn_a, server_conn_b, _client_conn_a, _client_conn_b) =
+            time::timeout(Duration::from_secs(5), async {
+                tokio::try_join!(
+                    async { server_a.accept().await.anyerr()?.await.anyerr() },
+                    async { server_b.accept().await.anyerr()?.await.anyerr() },
+                    async { dial_a.await.anyerr() },
+                    async { dial_b.await.anyerr() },
+                )
+            })
+            .await
+            .anyerr()??;
+
+        assert_eq!(
+            server_conn_a.alpn(),
+            ALPN_A,
+            "destination A received another dial's QUIC Initial"
+        );
+        assert_eq!(
+            server_conn_b.alpn(),
+            ALPN_B,
+            "destination B received another dial's QUIC Initial"
+        );
+
+        client.close().await;
+        server_a.close().await;
+        server_b.close().await;
         Ok(())
     }
 
@@ -4116,6 +4590,318 @@ mod tests {
             .await
             .std_context("waiting for endpoint to come online")?;
 
+        Ok(())
+    }
+
+    /// Replacing a relay configuration at the same URL must reconnect the
+    /// active relay client with the new token without replacing the endpoint
+    /// or its existing application connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_same_url_relay_token_rotation_preserves_connection() -> Result {
+        const TOKEN_A: &str = "token-a";
+        const TOKEN_B: &str = "token-b";
+
+        #[derive(Debug)]
+        struct RotatingTokenAccess {
+            expected: Arc<RwLock<String>>,
+            observed: mpsc::UnboundedSender<String>,
+        }
+
+        impl iroh_relay::server::AccessControl for RotatingTokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let token = request.auth_token().unwrap_or_default();
+                let _ = self.observed.send(token.clone());
+                if token == *self.expected.read().expect("token lock poisoned") {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+        }
+
+        let expected = Arc::new(RwLock::new(TOKEN_A.to_string()));
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let access = Arc::new(RotatingTokenAccess {
+            expected: expected.clone(),
+            observed: observed_tx,
+        });
+        let (_relay_map, relay_url, relay_server) =
+            run_relay_server_with_access(false, access).await?;
+        let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
+            .with_auth_token(TOKEN_A)
+            .into();
+
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(initial_map.clone()))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(initial_map))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for server relay")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for client relay")?;
+
+        let (client_done_tx, client_done_rx) = oneshot::channel();
+        let server_task: tokio::task::JoinHandle<Result<()>> = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let conn = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = conn.accept_bi().await.anyerr()?;
+
+                let mut before = [0; 6];
+                recv.read_exact(&mut before).await.anyerr()?;
+                assert_eq!(&before, b"before");
+                send.write_all(&before).await.anyerr()?;
+
+                let mut after = [0; 5];
+                recv.read_exact(&mut after).await.anyerr()?;
+                assert_eq!(&after, b"after");
+                send.write_all(&after).await.anyerr()?;
+
+                send.finish().anyerr()?;
+                let _ = client_done_rx.await;
+                Ok(())
+            })
+        };
+
+        let endpoint_id = client.id();
+        let connection = client.connect(server.addr(), TEST_ALPN).await?;
+        assert!(connection.paths().iter().all(|path| path.is_relay()));
+        let connection_id = connection.stable_id();
+        let (mut send, mut recv) = connection.open_bi().await.anyerr()?;
+        send.write_all(b"before").await.anyerr()?;
+        let mut echoed_before = [0; 6];
+        recv.read_exact(&mut echoed_before).await.anyerr()?;
+        assert_eq!(&echoed_before, b"before");
+
+        *expected.write().expect("token lock poisoned") = TOKEN_B.to_string();
+        client
+            .insert_relay(
+                relay_url.clone(),
+                Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
+            )
+            .await;
+
+        assert!(
+            relay_server
+                .relay_service()
+                .expect("relay service")
+                .clients()
+                .disconnect(client.id(), None)
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(token) = observed_rx.recv().await {
+                if token == TOKEN_B {
+                    return;
+                }
+            }
+            panic!("relay access-control observation channel closed");
+        })
+        .await
+        .std_context("waiting for relay client to authenticate with rotated token")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for rotated relay connection")?;
+
+        assert_eq!(client.id(), endpoint_id);
+        assert_eq!(connection.stable_id(), connection_id);
+        send.write_all(b"after").await.anyerr()?;
+        send.finish().anyerr()?;
+        let mut echoed_after = [0; 5];
+        recv.read_exact(&mut echoed_after).await.anyerr()?;
+        assert_eq!(&echoed_after, b"after");
+        let _ = client_done_tx.send(());
+
+        server_task.await.anyerr()??;
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// Updating the receiving endpoint's connection-scoped relay token must
+    /// not remove its working home-relay route before the relay expires the
+    /// old session. The next dial must then use the refreshed token while the
+    /// existing QUIC connection survives the relay reconnect.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_home_relay_token_rotation_preserves_receiving_connection() -> Result {
+        const TOKEN_A: &str = "token-a";
+        const TOKEN_B: &str = "token-b";
+
+        #[derive(Debug)]
+        struct DelayedRotatingTokenAccess {
+            expected: Arc<RwLock<String>>,
+            observed: mpsc::UnboundedSender<(EndpointId, String)>,
+            disconnected: mpsc::UnboundedSender<EndpointId>,
+            replacement_gate: Arc<Notify>,
+        }
+
+        impl iroh_relay::server::AccessControl for DelayedRotatingTokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let token = request.auth_token().unwrap_or_default();
+                let _ = self.observed.send((request.endpoint_id(), token.clone()));
+                if token == TOKEN_B {
+                    self.replacement_gate.notified().await;
+                }
+                if token == *self.expected.read().expect("token lock poisoned") {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+
+            fn on_disconnect(
+                &self,
+                endpoint_id: EndpointId,
+                _connection_id: iroh_relay::server::ConnectionId,
+            ) {
+                let _ = self.disconnected.send(endpoint_id);
+            }
+        }
+
+        let expected = Arc::new(RwLock::new(TOKEN_A.to_string()));
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
+        let replacement_gate = Arc::new(Notify::new());
+        let (client_done_tx, client_done_rx) = oneshot::channel();
+        let access = Arc::new(DelayedRotatingTokenAccess {
+            expected: expected.clone(),
+            observed: observed_tx,
+            disconnected: disconnected_tx,
+            replacement_gate: replacement_gate.clone(),
+        });
+        let (_relay_map, relay_url, relay_server) =
+            run_relay_server_with_access(false, access).await?;
+        let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
+            .with_auth_token(TOKEN_A)
+            .into();
+
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(initial_map.clone()))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(initial_map))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for server relay")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for client relay")?;
+
+        let server_task: tokio::task::JoinHandle<Result<()>> = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let connection = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = connection.accept_bi().await.anyerr()?;
+                for expected in [
+                    b"before".as_slice(),
+                    b"during".as_slice(),
+                    b"after".as_slice(),
+                ] {
+                    let mut received = vec![0; expected.len()];
+                    recv.read_exact(&mut received).await.anyerr()?;
+                    assert_eq!(received, expected);
+                    send.write_all(&received).await.anyerr()?;
+                }
+                let _ = send.finish();
+                let _ = client_done_rx.await;
+                Ok(())
+            })
+        };
+
+        let connection = client.connect(server.addr(), TEST_ALPN).await?;
+        assert!(connection.paths().iter().all(|path| path.is_relay()));
+        let connection_id = connection.stable_id();
+        let (mut send, mut recv) = connection.open_bi().await.anyerr()?;
+        send.write_all(b"before").await.anyerr()?;
+        let mut echoed_before = [0; 6];
+        recv.read_exact(&mut echoed_before).await.anyerr()?;
+        assert_eq!(&echoed_before, b"before");
+
+        *expected.write().expect("token lock poisoned") = TOKEN_B.to_string();
+        server
+            .insert_relay(
+                relay_url.clone(),
+                Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
+            )
+            .await;
+
+        // Give a break-before-make implementation time to cancel and
+        // unregister the existing receiver. A continuity-preserving update
+        // leaves this wait pending because the old connection remains live.
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            while let Some(endpoint_id) = disconnected_rx.recv().await {
+                if endpoint_id == server.id() {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        send.write_all(b"during").await.anyerr()?;
+        let mut echoed_during = [0; 6];
+        tokio::time::timeout(Duration::from_secs(1), recv.read_exact(&mut echoed_during))
+            .await
+            .std_context("receiver disappeared while replacement relay auth was pending")?
+            .anyerr()?;
+        assert_eq!(&echoed_during, b"during");
+
+        // Simulate relay-side JWT expiry. The active actor must reconnect
+        // with the latest token from the shared relay map.
+        assert!(
+            relay_server
+                .relay_service()
+                .expect("relay service")
+                .clients()
+                .disconnect(server.id(), None)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some((endpoint_id, token)) = observed_rx.recv().await {
+                if endpoint_id == server.id() && token == TOKEN_B {
+                    return;
+                }
+            }
+            panic!("relay access-control observation channel closed");
+        })
+        .await
+        .std_context("waiting for receiver to redial with rotated token")?;
+        replacement_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for receiver relay to reconnect")?;
+
+        assert_eq!(connection.stable_id(), connection_id);
+        assert_eq!(connection.close_reason(), None);
+        send.write_all(b"after").await.anyerr()?;
+        let _ = send.finish();
+        let mut echoed_after = [0; 5];
+        recv.read_exact(&mut echoed_after).await.anyerr()?;
+        assert_eq!(&echoed_after, b"after");
+        let _ = client_done_tx.send(());
+
+        server_task.await.anyerr()??;
+        client.close().await;
+        server.close().await;
         Ok(())
     }
 }

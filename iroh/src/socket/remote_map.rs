@@ -6,7 +6,7 @@ use std::{
     task::{Context, Poll, Waker, ready},
 };
 
-use iroh_base::{CustomAddr, EndpointAddr, EndpointId, RelayUrl};
+use iroh_base::{CustomAddr, EndpointAddr, EndpointId, RelayUrl, TransportAddr};
 use n0_future::task::JoinSet;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -70,12 +70,88 @@ pub(crate) struct RemoteMap {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MappedAddrs {
-    /// The mapping between [`EndpointId`]s and [`EndpointIdMappedAddr`]s.
-    pub(super) endpoint_addrs: AddrMap<EndpointId, EndpointIdMappedAddr>,
+    /// Maps a unique outgoing dial address to its immutable bootstrap authority.
+    pub(super) endpoint_addrs: AddrMap<BootstrapAuthority, EndpointIdMappedAddr>,
     /// The mapping between endpoints via a relay and their [`RelayMappedAddr`]s.
     pub(super) relay_addrs: AddrMap<(RelayUrl, EndpointId), RelayMappedAddr>,
     /// The mapping between custom transport addresses and their [`CustomMappedAddr`]s.
     pub(super) custom_addrs: AddrMap<CustomAddr, CustomMappedAddr>,
+}
+
+/// Immutable authority for one outgoing connection attempt.
+///
+/// The corresponding unique [`EndpointIdMappedAddr`] is carried by Noq as the attempt token.
+/// Looking it up when an Initial is sent recovers exactly the addresses supplied to that dial.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct BootstrapAuthority {
+    endpoint_id: EndpointId,
+    explicit_addrs: Arc<BTreeSet<transports::Addr>>,
+}
+
+impl BootstrapAuthority {
+    pub(crate) fn new(endpoint_id: EndpointId, explicit_addrs: BTreeSet<TransportAddr>) -> Self {
+        let explicit_addrs = explicit_addrs
+            .into_iter()
+            .filter_map(|addr| match addr {
+                TransportAddr::Relay(url) => Some(transports::Addr::from((url, endpoint_id))),
+                TransportAddr::Ip(addr) => Some(transports::Addr::from(addr)),
+                TransportAddr::Custom(addr) => Some(transports::Addr::from(addr)),
+                _ => None,
+            })
+            .collect();
+        Self {
+            endpoint_id,
+            explicit_addrs: Arc::new(explicit_addrs),
+        }
+    }
+
+    pub(super) fn endpoint_id(&self) -> EndpointId {
+        self.endpoint_id
+    }
+
+    /// Whether `addr` is a permitted bootstrap path for this attempt and actor.
+    ///
+    /// Relays remain valid bootstrap paths even when discovered after the dial starts. Direct
+    /// and custom paths must be exact members of this attempt's caller-supplied address set.
+    pub(super) fn permits(&self, actor_endpoint_id: EndpointId, addr: &transports::Addr) -> bool {
+        if self.endpoint_id != actor_endpoint_id {
+            return false;
+        }
+        match addr {
+            transports::Addr::Relay(_, endpoint_id) => *endpoint_id == actor_endpoint_id,
+            transports::Addr::Ip(_) | transports::Addr::Custom(_) => {
+                self.explicit_addrs.contains(addr)
+            }
+        }
+    }
+}
+
+/// A resolved outgoing dial whose mapped address keeps its authority registered.
+#[derive(Debug)]
+pub(crate) struct ResolvedRemote {
+    mapped_addr: EndpointIdMappedAddr,
+    endpoint_addrs: AddrMap<BootstrapAuthority, EndpointIdMappedAddr>,
+}
+
+impl ResolvedRemote {
+    pub(crate) fn register(mapped_addrs: &MappedAddrs, authority: BootstrapAuthority) -> Self {
+        let endpoint_addrs = mapped_addrs.endpoint_addrs.clone();
+        let mapped_addr = endpoint_addrs.insert_unique(authority);
+        Self {
+            mapped_addr,
+            endpoint_addrs,
+        }
+    }
+
+    pub(crate) fn mapped_addr(&self) -> EndpointIdMappedAddr {
+        self.mapped_addr
+    }
+}
+
+impl Drop for ResolvedRemote {
+    fn drop(&mut self) {
+        self.endpoint_addrs.remove(&self.mapped_addr);
+    }
 }
 
 /// Converts a mapped socket address to a transport address.
@@ -147,6 +223,8 @@ struct Tasks {
     poll_cleanup_waker: Option<Waker>,
     /// The path selector used by all [`RemoteStateActor`]s spawned by this map.
     path_selector: Arc<dyn PathSelector>,
+    /// Whether new connections require application authorization before NAT traversal.
+    defer_nat_traversal_until_authorized: bool,
     /// The tracing span for this endpoint, to be used as parent span for `RemoteStateActor` tasks.
     span: Span,
 }
@@ -159,6 +237,7 @@ impl RemoteMap {
         address_lookup: address_lookup::AddressLookupServices,
         shutdown_token: CancellationToken,
         path_selector: Arc<dyn PathSelector>,
+        defer_nat_traversal_until_authorized: bool,
         span: Span,
     ) -> Self {
         Self {
@@ -172,6 +251,7 @@ impl RemoteMap {
                 tasks: Default::default(),
                 poll_cleanup_waker: None,
                 path_selector,
+                defer_nat_traversal_until_authorized,
                 span,
             },
         }
@@ -264,10 +344,14 @@ impl RemoteMap {
         &mut self,
         addr: EndpointAddr,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
     ) {
         let EndpointAddr { id, addrs } = addr;
-        self.send_to_actor(id, RemoteStateMessage::ResolveRemote(addrs, tx))
-            .await
+        self.send_to_actor(
+            id,
+            RemoteStateMessage::ResolveRemote(addrs, tx, cancellation),
+        )
+        .await
     }
 
     pub(super) async fn add_connection(
@@ -278,6 +362,29 @@ impl RemoteMap {
     ) {
         self.send_to_actor(remote, RemoteStateMessage::AddConnection(conn, tx))
             .await
+    }
+
+    /// Authorizes NAT traversal only if the existing actor still owns the exact connection.
+    ///
+    /// Unlike [`Self::send_to_actor`], this deliberately never creates or restarts an actor.
+    /// Losing either actor or connection must fail closed.
+    pub(super) async fn authorize_nat_traversal(
+        &mut self,
+        remote: EndpointId,
+        connection_id: usize,
+        reply: oneshot::Sender<bool>,
+    ) {
+        let Some(sender) = self.senders.read_only().get(&remote) else {
+            reply.send(false).ok();
+            return;
+        };
+        sender
+            .send(RemoteStateMessage::AuthorizeNatTraversal {
+                connection_id,
+                reply,
+            })
+            .await
+            .ok();
     }
 
     /// Sends a message to a `RemoteStateActor`, starting it if not running already.
@@ -325,8 +432,6 @@ impl Tasks {
         initial_msgs: Vec<RemoteStateMessage>,
         mapped_addrs: &MappedAddrs,
     ) -> mpsc::Sender<RemoteStateMessage> {
-        // Ensure there is a RemoteMappedAddr for this EndpointId.
-        mapped_addrs.endpoint_addrs.get(&eid);
         let sender = RemoteStateActor::new(
             eid,
             self.local_direct_addrs.clone(),
@@ -335,6 +440,7 @@ impl Tasks {
             self.metrics.clone(),
             self.address_lookup.clone(),
             self.path_selector.clone(),
+            self.defer_nat_traversal_until_authorized,
         )
         .start(
             initial_msgs,
@@ -401,10 +507,33 @@ mod tests {
             address_lookup::AddressLookupServices::default(),
             shutdown_token.clone(),
             Arc::new(BiasedRttPathSelector::default()),
+            false,
             Span::none(),
         );
         let guards = (watchable, shutdown_token.clone().drop_guard());
         (remote_map, shutdown_token, guards)
+    }
+
+    #[test]
+    fn resolved_remote_unregisters_attempt_authority_on_drop() {
+        let mapped_addrs = MappedAddrs::default();
+        let endpoint_id = SecretKey::from_bytes(&[7; 32]).public();
+        let authority = BootstrapAuthority::new(
+            endpoint_id,
+            BTreeSet::from([TransportAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 4242)))]),
+        );
+
+        let resolved = ResolvedRemote::register(&mapped_addrs, authority.clone());
+        let mapped_addr = resolved.mapped_addr();
+        assert_eq!(mapped_addrs.endpoint_addrs.len(), 1);
+        assert_eq!(
+            mapped_addrs.endpoint_addrs.lookup(&mapped_addr),
+            Some(authority)
+        );
+
+        drop(resolved);
+        assert_eq!(mapped_addrs.endpoint_addrs.len(), 0);
+        assert_eq!(mapped_addrs.endpoint_addrs.lookup(&mapped_addr), None);
     }
 
     /// Regression test: No new RemoteStateActors may be started before
@@ -427,7 +556,9 @@ mod tests {
 
         // 1. Spawn A1 and let it process a real `ResolveRemote`.
         let (tx1, rx1) = oneshot::channel();
-        remote_map.resolve_remote(addr_with_ip(1234), tx1).await;
+        remote_map
+            .resolve_remote(addr_with_ip(1234), tx1, CancellationToken::new())
+            .await;
         assert!(
             matches!(rx1.await, Ok(Ok(()))),
             "First resolve completes Ok"
@@ -447,7 +578,9 @@ mod tests {
         //    We also resume time here so that we don't immediately idle-out again.
         tokio::time::resume();
         let (tx2, rx2) = oneshot::channel();
-        remote_map.resolve_remote(addr_with_ip(5678), tx2).await;
+        remote_map
+            .resolve_remote(addr_with_ip(5678), tx2, CancellationToken::new())
+            .await;
 
         // 4. Drive `cleanup`, like the socket actor does.
         //    Before our fixes, this would remove the sender to the just-started A2 from the sender map.
@@ -458,7 +591,9 @@ mod tests {
         //    the fix this would start a new actor because A2 was falsely removed from
         //    the senders map.
         let (tx3, rx3) = oneshot::channel();
-        remote_map.resolve_remote(EndpointAddr::new(eid), tx3).await;
+        remote_map
+            .resolve_remote(EndpointAddr::new(eid), tx3, CancellationToken::new())
+            .await;
 
         let outcome2 = rx2.await.expect("the resolve tx must be sent");
         let outcome3 = rx3.await.expect("the resolve tx must be sent");

@@ -19,7 +19,7 @@ use noq::{Closed, PathStats, PathStatus, WeakConnectionHandle};
 use noq_proto::{PathError, PathEvent as NoqPathEvent, PathId, n0_nat_traversal};
 use rustc_hash::FxHashMap;
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 use tracing::{Instrument, Level, Span, debug, error, event, info_span, instrument, trace, warn};
 
 use self::path_state::RemotePathState;
@@ -28,7 +28,7 @@ pub use self::{
     path_watcher::{Path, PathEvent, PathEventStream, PathList, PathListIter, PathListStream},
     remote_info::{RemoteInfo, TransportAddrInfo, TransportAddrUsage},
 };
-use super::Source;
+use super::{BootstrapAuthority, Source};
 use crate::{
     address_lookup::{AddressLookupFailed, AddressLookupServices, Item as AddressLookupItem},
     endpoint::DirectAddr,
@@ -52,6 +52,43 @@ const HOLEPUNCH_ATTEMPTS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// The latency at or under which we don't try to upgrade to a better path.
 const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
+
+/// Maximum number of distinct paths waiting for a path-open retry.
+///
+/// A failed retry is attempted on every connection to the remote. Bounding and
+/// deduplicating this queue prevents that fan-out from growing it indefinitely.
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+#[derive(Default)]
+struct PendingOpenPaths {
+    entries: VecDeque<transports::FourTuple>,
+}
+
+impl PendingOpenPaths {
+    fn enqueue(&mut self, addr: transports::FourTuple) {
+        if self.entries.contains(&addr) {
+            return;
+        }
+        if self.entries.len() >= MAX_PENDING_OPEN_PATHS {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(addr);
+    }
+
+    fn pop_front(&mut self) -> Option<transports::FourTuple> {
+        self.entries.pop_front()
+    }
+
+    #[cfg(test)]
+    fn contains(&self, addr: &transports::FourTuple) -> bool {
+        self.entries.contains(addr)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
 
 // TODO: use this
 // /// How long since the last activity we try to keep an established endpoint peering alive.
@@ -123,7 +160,8 @@ struct State {
     custom_mapped_addrs: AddrMap<CustomAddr, CustomMappedAddr>,
     /// Address lookup service, cloned from the socket.
     address_lookup: AddressLookupServices,
-
+    /// Whether each connection requires application authorization before NAT traversal.
+    defer_nat_traversal_until_authorized: bool,
     // Internal state - Noq Connections we are managing.
     //
     /// Notifications when connections are closed.
@@ -159,12 +197,15 @@ struct State {
     /// Paths which we still need to open.
     ///
     /// They failed to open because we did not have enough CIDs issued by the remote.
-    pending_open_paths: VecDeque<transports::FourTuple>,
+    pending_open_paths: PendingOpenPaths,
 
     // Internal state - address lookup
     //
     /// Stream of Address Lookup results, or always pending if Address Lookup is not running.
     address_lookup_stream: Option<BoxStream<Result<AddressLookupItem, AddressLookupFailed>>>,
+
+    /// Cancellation notifications for callers waiting on Address Lookup.
+    address_lookup_cancellations: FuturesUnordered<WaitForCancellationFutureOwned>,
 
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
@@ -180,6 +221,7 @@ impl RemoteStateActor {
         metrics: Arc<SocketMetrics>,
         address_lookup: AddressLookupServices,
         path_selector: Arc<dyn PathSelector>,
+        defer_nat_traversal_until_authorized: bool,
     ) -> Self {
         Self {
             connections: FxHashMap::default(),
@@ -190,6 +232,7 @@ impl RemoteStateActor {
                 relay_mapped_addrs,
                 custom_mapped_addrs,
                 address_lookup,
+                defer_nat_traversal_until_authorized,
                 connections_close: Default::default(),
                 path_events: Default::default(),
                 addr_events: Default::default(),
@@ -198,8 +241,9 @@ impl RemoteStateActor {
                 selected_path: Default::default(),
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
-                pending_open_paths: VecDeque::new(),
+                pending_open_paths: PendingOpenPaths::default(),
                 address_lookup_stream: None,
+                address_lookup_cancellations: FuturesUnordered::new(),
                 path_selector,
             },
         }
@@ -258,8 +302,9 @@ impl RemoteStateActor {
                 None => MaybeFuture::None,
             };
             n0_future::pin!(scheduled_path_open);
-            let scheduled_hp = match self.state.scheduled_holepunch {
-                Some(when) => MaybeFuture::Some(time::sleep_until(when)),
+            let scheduled_holepunch = self.next_scheduled_holepunch();
+            let scheduled_hp = match scheduled_holepunch {
+                Some((_, when)) => MaybeFuture::Some(time::sleep_until(when)),
                 None => MaybeFuture::None,
             };
             n0_future::pin!(scheduled_hp);
@@ -276,6 +321,9 @@ impl RemoteStateActor {
                     trace!("actor cancelled");
                     break;
                 }
+                Some(()) = self.state.address_lookup_cancellations.next(), if !self.state.address_lookup_cancellations.is_empty() => {
+                    self.state.handle_resolve_cancellation(self.connections.is_empty());
+                }
                 msg = inbox.recv() => {
                     match msg {
                         Some(msg) => self.handle_message(msg).await,
@@ -286,8 +334,23 @@ impl RemoteStateActor {
                     self.handle_path_event(id, evt);
                 }
                 Some((id, evt)) = self.state.addr_events.next() => {
-                    trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
-                    self.trigger_holepunching();
+                    if let Some(state) = self
+                        .connections
+                        .get_mut(&id)
+                        .filter(|state| state.nat_traversal_authorized)
+                    {
+                        if state.handle.upgrade().is_some_and(|conn| {
+                            conn.get_remote_nat_traversal_addresses()
+                                .is_ok_and(|addrs| !addrs.is_empty())
+                        }) {
+                            state.peer_candidates_observed = true;
+                        }
+                        trace!(?id, ?evt, "remote addrs updated, triggering holepunching");
+                        self.select_path();
+                        self.trigger_holepunching_for(Some(id));
+                    } else {
+                        trace!(?id, ?evt, "ignoring remote addrs before authorization");
+                    }
                 }
                 Some((conn_id, closed)) = self.state.connections_close.next(), if !self.state.connections_close.is_empty() => {
                     self.handle_connection_close(conn_id, closed);
@@ -299,7 +362,7 @@ impl RemoteStateActor {
                     }
                     self.update_local_direct_address();
                     trace!("local addrs updated, triggering holepunching");
-                    self.trigger_holepunching();
+                    self.trigger_holepunching_all();
                 }
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
@@ -311,8 +374,15 @@ impl RemoteStateActor {
                 }
                 _ = &mut scheduled_hp => {
                     trace!("triggering scheduled holepunching");
-                    self.state.scheduled_holepunch = None;
-                    self.trigger_holepunching();
+                    let conn_id = scheduled_holepunch.and_then(|(conn_id, _)| conn_id);
+                    if let Some(conn_id) = conn_id {
+                        if let Some(state) = self.connections.get_mut(&conn_id) {
+                            state.scheduled_holepunch = None;
+                        }
+                    } else {
+                        self.state.scheduled_holepunch = None;
+                    }
+                    self.trigger_holepunching_for(conn_id);
                 }
                 Some(item) = maybe_next(self.state.address_lookup_stream.as_mut()), if self.state.address_lookup_stream.is_some() => {
                     self.state.handle_address_lookup_item(item);
@@ -356,14 +426,25 @@ impl RemoteStateActor {
     async fn handle_message(&mut self, msg: RemoteStateMessage) {
         // trace!("handling message");
         match msg {
-            RemoteStateMessage::SendDatagram(sender, transmit) => {
-                self.state.handle_msg_send_datagram(sender, transmit).await;
+            RemoteStateMessage::SendDatagram(authority, sender, transmit) => {
+                self.state
+                    .handle_msg_send_datagram(authority, sender, transmit)
+                    .await;
             }
             RemoteStateMessage::AddConnection(handle, tx) => {
                 self.handle_msg_add_connection(handle, tx);
             }
-            RemoteStateMessage::ResolveRemote(addrs, tx) => {
-                self.state.handle_msg_resolve_remote(addrs, tx);
+            RemoteStateMessage::AuthorizeNatTraversal {
+                connection_id,
+                reply,
+            } => {
+                reply
+                    .send(self.handle_msg_authorize_nat_traversal(ConnId(connection_id)))
+                    .ok();
+            }
+            RemoteStateMessage::ResolveRemote(addrs, tx, cancellation) => {
+                self.state
+                    .handle_msg_resolve_remote(addrs, tx, cancellation);
             }
             RemoteStateMessage::RemoteInfo(tx) => {
                 let addrs = self.state.paths.to_remote_addrs();
@@ -403,8 +484,11 @@ impl RemoteStateActor {
         self.state.connections_close.push(OnClosed::new(&conn));
 
         // Add local addrs to the connection
-        let local_addrs = self.state.local_candidates();
-        update_qnt_candidates(&conn, &local_addrs);
+        let nat_traversal_authorized = !self.state.defer_nat_traversal_until_authorized;
+        if nat_traversal_authorized {
+            let local_addrs = self.state.local_candidates();
+            update_qnt_candidates(&conn, &local_addrs);
+        }
 
         // Store the connection
         let conn_state = self
@@ -415,6 +499,10 @@ impl RemoteStateActor {
                 path_state: path_state_sender,
                 paths: Default::default(),
                 has_been_direct: false,
+                nat_traversal_authorized,
+                peer_candidates_observed: nat_traversal_authorized,
+                last_holepunch: None,
+                scheduled_holepunch: None,
             })
             .into_mut();
 
@@ -425,9 +513,14 @@ impl RemoteStateActor {
                 .state
                 .register_and_configure_path(conn_id, conn_state, &path);
 
+            if let Some(path_remote) = path_remote.as_ref() {
+                conn_state.record_deferred_bootstrap_selection(PathId::ZERO, path_remote);
+            }
+
             if let Some(path_remote) = path_remote
                 && !path_remote.is_relay()
                 && conn.side().is_client()
+                && conn_state.nat_traversal_authorized
             {
                 // We may have raced this with a relay address.  Try and add any
                 // relay addresses we have back.
@@ -444,15 +537,50 @@ impl RemoteStateActor {
                 }
             }
         }
-        self.trigger_holepunching();
+        if nat_traversal_authorized {
+            self.trigger_holepunching();
+        }
         self.select_path();
         tx.send(path_state_receiver).ok();
+    }
+
+    /// Authorizes noq first, then releases Iroh's per-connection path-management gate.
+    fn handle_msg_authorize_nat_traversal(&mut self, conn_id: ConnId) -> bool {
+        let Some(conn_state) = self.connections.get_mut(&conn_id) else {
+            return false;
+        };
+        let Some(conn) = conn_state.handle.upgrade() else {
+            return false;
+        };
+        if conn.close_reason().is_some() {
+            return false;
+        }
+        if conn_state.nat_traversal_authorized {
+            return true;
+        }
+
+        conn.authorize_nat_traversal();
+        conn_state.nat_traversal_authorized = true;
+
+        let local_addrs = self.state.local_candidates();
+        update_qnt_candidates(&conn, &local_addrs);
+
+        // A prior connection's attempt must not delay this exact connection's activation.
+        conn_state.last_holepunch = None;
+        conn_state.scheduled_holepunch = None;
+        self.select_path();
+        self.trigger_holepunching_for(Some(conn_id));
+        true
     }
 
     /// Handles [`RemoteStateMessage::NetworkChange`].
     fn handle_msg_network_change(&mut self, is_major: bool) {
         // Ping all the paths so loss-detection starts ASAP.
-        for conn in self.connections.values() {
+        for conn in self
+            .connections
+            .values()
+            .filter(|state| state.nat_traversal_authorized)
+        {
             if let Some(noq_conn) = conn.handle.upgrade() {
                 for (path_id, addr) in &conn.paths {
                     if let Some(path) = noq_conn.path(*path_id) {
@@ -466,7 +594,7 @@ impl RemoteStateActor {
         }
 
         if is_major {
-            self.trigger_holepunching();
+            self.trigger_holepunching_all();
         }
     }
 
@@ -483,8 +611,12 @@ impl RemoteStateActor {
             self.state.metrics.num_conns_closed.inc();
             conn_state.path_state.close(closed);
         }
-        if self.connections.is_empty() {
-            trace!("last connection closed - clearing selected_path");
+        if self
+            .connections
+            .values()
+            .all(|state| !state.nat_traversal_authorized)
+        {
+            trace!("last authorized connection closed - clearing selected_path");
             self.state.selected_path = None;
         }
     }
@@ -495,37 +627,88 @@ impl RemoteStateActor {
     /// candidates.
     fn update_local_direct_address(&mut self) {
         let local_addrs = self.state.local_candidates();
-        for conn in self.connections.values().filter_map(|s| s.handle.upgrade()) {
+        for conn in self
+            .connections
+            .values()
+            .filter(|state| state.nat_traversal_authorized)
+            .filter_map(|state| state.handle.upgrade())
+        {
             update_qnt_candidates(&conn, &local_addrs);
         }
         // todo: trace
     }
 
+    fn next_scheduled_holepunch(&self) -> Option<(Option<ConnId>, Instant)> {
+        if self.state.defer_nat_traversal_until_authorized {
+            self.connections
+                .iter()
+                .filter_map(|(id, state)| state.scheduled_holepunch.map(|when| (*id, when)))
+                .min_by_key(|(_, when)| *when)
+                .map(|(id, when)| (Some(id), when))
+        } else {
+            self.state.scheduled_holepunch.map(|when| (None, when))
+        }
+    }
+
+    /// Triggers all exact deferred client connections, while preserving the upstream
+    /// lowest-client behavior when the gate is disabled.
+    fn trigger_holepunching_all(&mut self) {
+        if !self.state.defer_nat_traversal_until_authorized {
+            self.trigger_holepunching();
+            return;
+        }
+        let connection_ids = self
+            .connections
+            .iter()
+            .filter(|(_, state)| state.nat_traversal_authorized)
+            .filter_map(|(id, state)| {
+                state
+                    .handle
+                    .upgrade()
+                    .filter(|conn| conn.side().is_client())
+                    .map(|_| *id)
+            })
+            .collect::<Vec<_>>();
+        for conn_id in connection_ids {
+            self.trigger_holepunching_for(Some(conn_id));
+        }
+    }
+
     /// Triggers holepunching to the remote endpoint.
-    ///
-    /// This will manage the entire process of holepunching with the remote endpoint.
-    ///
-    /// - Holepunching happens on the Connection with the lowest [`ConnId`] which is a
-    ///   client.
-    ///   - Both endpoints may initiate holepunching if both have a client connection.
-    ///   - Any opened paths are opened on all other connections without holepunching.
-    /// - If there are no changes in local or remote candidate addresses since the
-    ///   last attempt **and** there was a recent attempt, a trigger_holepunching call
-    ///   will be scheduled instead.
     fn trigger_holepunching(&mut self) {
+        self.trigger_holepunching_for(None);
+    }
+
+    /// Triggers holepunching on an exact deferred connection when supplied.
+    fn trigger_holepunching_for(&mut self, preferred: Option<ConnId>) {
         if self.connections.is_empty() {
             trace!("not holepunching: no connections");
             return;
         }
 
-        let Some(conn) = self
-            .connections
-            .iter()
-            .filter_map(|(id, state)| state.handle.upgrade().map(|conn| (*id, conn)))
-            .filter(|(_, conn)| conn.side().is_client())
-            .min_by_key(|(id, _)| *id)
-            .map(|(_, conn)| conn)
-        else {
+        let preferred = self
+            .state
+            .defer_nat_traversal_until_authorized
+            .then_some(preferred)
+            .flatten();
+        let selected = if let Some(id) = preferred {
+            (|| {
+                let state = self.connections.get(&id)?;
+                if !state.nat_traversal_authorized {
+                    return None;
+                }
+                let conn = state.handle.upgrade()?;
+                conn.side().is_client().then_some((id, conn))
+            })()
+        } else {
+            self.connections
+                .iter()
+                .filter(|(_, state)| state.nat_traversal_authorized)
+                .filter_map(|(id, state)| state.handle.upgrade().map(|conn| (*id, conn)))
+                .filter(|(_, conn)| conn.side().is_client())
+                .min_by_key(|(id, _)| *id)
+        };
+        let Some((conn_id, conn)) = selected else {
             trace!("not holepunching: no client connection");
             return;
         };
@@ -537,10 +720,14 @@ impl RemoteStateActor {
             }
         };
         let local_candidates = self.state.local_candidates();
-        let new_candidates = self
-            .state
-            .last_holepunch
-            .as_ref()
+        let last_holepunch = if self.state.defer_nat_traversal_until_authorized {
+            self.connections
+                .get(&conn_id)
+                .and_then(|state| state.last_holepunch.as_ref())
+        } else {
+            self.state.last_holepunch.as_ref()
+        };
+        let new_candidates = last_holepunch
             .map(|last_hp| {
                 // Addrs are allowed to disappear, but if there are new ones we need to
                 // holepunch again.
@@ -554,17 +741,68 @@ impl RemoteStateActor {
                     || !local_candidates.is_subset(&last_hp.local_candidates)
             })
             .unwrap_or(true);
-        if !new_candidates && let Some(ref last_hp) = self.state.last_holepunch {
+        if !new_candidates && let Some(last_hp) = last_holepunch {
             let next_hp = last_hp.when + HOLEPUNCH_ATTEMPTS_INTERVAL;
             let now = Instant::now();
             if next_hp > now {
                 trace!(scheduled_in = ?(next_hp - now), "not holepunching: no new addresses");
-                self.state.scheduled_holepunch = Some(next_hp);
+                if self.state.defer_nat_traversal_until_authorized {
+                    if let Some(state) = self.connections.get_mut(&conn_id) {
+                        state.scheduled_holepunch = Some(next_hp);
+                    }
+                } else {
+                    self.state.scheduled_holepunch = Some(next_hp);
+                }
                 return;
             }
         }
 
-        self.state.do_holepunching(conn);
+        self.state.metrics.holepunch_attempts.inc();
+        match conn.initiate_nat_traversal_round() {
+            Ok(remote_candidates) => {
+                let remote_candidates = remote_candidates
+                    .iter()
+                    .map(|addr| SocketAddr::new(addr.ip().to_canonical(), addr.port()))
+                    .collect();
+                event!(
+                    target: "iroh::_events::qnt::init",
+                    Level::DEBUG,
+                    remote = %self.state.endpoint_id.fmt_short(),
+                    ?local_candidates,
+                    ?remote_candidates,
+                );
+                let attempt = HolepunchAttempt {
+                    when: Instant::now(),
+                    local_candidates,
+                    remote_candidates,
+                };
+                if self.state.defer_nat_traversal_until_authorized {
+                    if let Some(state) = self.connections.get_mut(&conn_id) {
+                        state.last_holepunch = Some(attempt);
+                        state.scheduled_holepunch = None;
+                    }
+                } else {
+                    self.state.last_holepunch = Some(attempt);
+                    self.state.scheduled_holepunch = None;
+                }
+            }
+            Err(err) => {
+                debug!(%conn_id, "failed to initiate NAT traversal: {err:#}");
+                use noq_proto::n0_nat_traversal::Error;
+                let retry = matches!(err, Error::Multipath(_) | Error::NotEnoughAddresses);
+                if retry {
+                    let next_hp = Instant::now() + Duration::from_millis(100);
+                    trace!(scheduled_in = ?Duration::from_millis(100), "holepunching retry");
+                    if self.state.defer_nat_traversal_until_authorized {
+                        if let Some(state) = self.connections.get_mut(&conn_id) {
+                            state.scheduled_holepunch = Some(next_hp);
+                        }
+                    } else {
+                        self.state.scheduled_holepunch = Some(next_hp);
+                    }
+                }
+            }
+        }
     }
 
     #[instrument(skip(self))]
@@ -583,6 +821,18 @@ impl RemoteStateActor {
             trace!("event for closed connection");
             return;
         };
+        if !conn_state.nat_traversal_authorized
+            && matches!(
+                &event,
+                NoqPathEvent::Established { id, .. }
+                    | NoqPathEvent::Abandoned { id, .. }
+                    | NoqPathEvent::Discarded { id, .. }
+                    if *id != PathId::ZERO
+            )
+        {
+            trace!(%conn_id, ?event, "ignoring non-bootstrap path event before authorization");
+            return;
+        }
         trace!("path event");
         match event {
             NoqPathEvent::Established { id: path_id, .. } => {
@@ -591,8 +841,12 @@ impl RemoteStateActor {
                     return;
                 };
 
-                self.state
-                    .register_and_configure_path(conn_id, conn_state, &path);
+                if let Some(path_remote) = self
+                    .state
+                    .register_and_configure_path(conn_id, conn_state, &path)
+                {
+                    conn_state.record_deferred_bootstrap_selection(path_id, &path_remote);
+                }
                 self.select_path();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
@@ -687,9 +941,19 @@ impl RemoteStateActor {
         };
 
         for (conn_id, conn_state) in self.connections.iter() {
+            if !conn_state.nat_traversal_authorized {
+                continue;
+            }
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
+            if self.state.defer_nat_traversal_until_authorized
+                && !conn_state.peer_candidates_observed
+            {
+                self.state
+                    .apply_existing_selected_path(*conn_id, conn_state, &conn, &selected);
+                continue;
+            }
 
             // Open path if it doesn't exist yet.
             self.state
@@ -737,6 +1001,14 @@ impl RemoteStateActor {
 
     fn open_path_on_all_conns(&mut self, open_addr: &transports::FourTuple) {
         for (conn_id, conn_state) in self.connections.iter() {
+            if !conn_state.nat_traversal_authorized {
+                continue;
+            }
+            if self.state.defer_nat_traversal_until_authorized
+                && !conn_state.peer_candidates_observed
+            {
+                continue;
+            }
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
@@ -750,7 +1022,11 @@ impl RemoteStateActor {
     /// Currently we need to have 1 IP path, with a good enough latency.
     fn check_connections(&mut self) {
         let mut is_goodenough = true;
-        for conn_state in self.connections.values() {
+        for conn_state in self
+            .connections
+            .values()
+            .filter(|state| state.nat_traversal_authorized)
+        {
             let mut is_conn_goodenough = false;
             if let Some(conn) = conn_state.handle.upgrade() {
                 let min_ip_rtt = conn_state
@@ -778,7 +1054,7 @@ impl RemoteStateActor {
 
         if !is_goodenough {
             debug!("connections are not good enough, triggering holepunching");
-            self.trigger_holepunching();
+            self.trigger_holepunching_all();
         }
     }
 }
@@ -787,6 +1063,7 @@ impl State {
     /// Handles [`RemoteStateMessage::SendDatagram`].
     async fn handle_msg_send_datagram(
         &mut self,
+        authority: BootstrapAuthority,
         mut sender: Box<TransportsSender>,
         transmit: OwnedTransmit,
     ) {
@@ -796,7 +1073,11 @@ impl State {
         // though we might not have a relay transport or ip-capable transport set up.
         // So these errors must not be fatal for this actor (or even this operation).
 
-        if let Some(addr) = self.selected_path.as_ref() {
+        if let Some(addr) = self
+            .selected_path
+            .as_ref()
+            .filter(|addr| self.bootstrap_path_allowed(&authority, &addr.remote()))
+        {
             trace!(?addr, "sending datagram to selected path");
 
             // TODO(Frando): We might want to include a local IP here in the future, if we confidently
@@ -815,10 +1096,16 @@ impl State {
                 warn!("Cannot send datagrams: No paths to remote endpoint known");
             }
 
-            for addr in self.paths.addrs() {
+            let bootstrap_paths = self
+                .paths
+                .addrs()
+                .filter(|addr| self.bootstrap_path_allowed(&authority, addr))
+                .cloned()
+                .collect::<Vec<_>>();
+            for addr in bootstrap_paths {
                 // We never want to send to our local addresses.
                 // The local address set is updated in the main loop so we can use `peek` here.
-                if let transports::Addr::Ip(sockaddr) = addr
+                if let transports::Addr::Ip(sockaddr) = &addr
                     && self
                         .local_direct_addrs
                         .peek()
@@ -851,12 +1138,28 @@ impl State {
         &mut self,
         addrs: BTreeSet<TransportAddr>,
         tx: oneshot::Sender<Result<(), AddressLookupFailed>>,
+        cancellation: CancellationToken,
     ) {
-        let addrs = to_transports_addr(self.endpoint_id, addrs);
-        self.paths.insert_multiple(addrs, Source::App);
-        self.paths.resolve_remote(tx);
+        let addrs = to_transports_addr(self.endpoint_id, addrs).collect::<Vec<_>>();
+        self.paths.insert_multiple(addrs.into_iter(), Source::App);
+        if self.paths.resolve_remote(tx, cancellation.clone()) {
+            self.address_lookup_cancellations
+                .push(cancellation.cancelled_owned());
+        }
         // Start Address Lookup if we have no selected path.
         self.trigger_address_lookup();
+    }
+
+    /// Releases a lookup once every caller waiting on an address has cancelled.
+    fn handle_resolve_cancellation(&mut self, connections_are_empty: bool) {
+        self.paths.prune_cancelled_resolve_requests();
+        if connections_are_empty
+            && self.selected_path.is_none()
+            && self.paths.is_empty()
+            && self.paths.resolve_requests_is_empty()
+        {
+            self.address_lookup_stream = None;
+        }
     }
 
     /// Triggers Address Lookup for the remote endpoint, if needed.
@@ -919,52 +1222,6 @@ impl State {
         }
     }
 
-    /// Unconditionally perform holepunching.
-    #[instrument(skip_all)]
-    fn do_holepunching(&mut self, conn: noq::Connection) {
-        self.metrics.holepunch_attempts.inc();
-        let local_candidates = self.local_candidates();
-        match conn.initiate_nat_traversal_round() {
-            Ok(remote_candidates) => {
-                let remote_candidates = remote_candidates
-                    .iter()
-                    .map(|addr| SocketAddr::new(addr.ip().to_canonical(), addr.port()))
-                    .collect();
-                event!(
-                    target: "iroh::_events::qnt::init",
-                    Level::DEBUG,
-                    remote = %self.endpoint_id.fmt_short(),
-                    ?local_candidates,
-                    ?remote_candidates,
-                );
-                self.last_holepunch = Some(HolepunchAttempt {
-                    when: Instant::now(),
-                    local_candidates,
-                    remote_candidates,
-                });
-            }
-            Err(err) => {
-                debug!("failed to initiate NAT traversal: {err:#}");
-                use noq_proto::n0_nat_traversal::Error;
-                match err {
-                    Error::Closed
-                    | Error::TooManyAddresses
-                    | Error::WrongConnectionSide
-                    | Error::ExtensionNotNegotiated => {
-                        // Fatal, no need to retry for now
-                    }
-                    Error::Multipath(_) | Error::NotEnoughAddresses => {
-                        // Retry in a bit
-                        let now = Instant::now();
-                        let next_hp = now + Duration::from_millis(100);
-                        trace!(scheduled_in = ?(next_hp - now), "holepunching retry");
-                        self.scheduled_holepunch = Some(next_hp);
-                    }
-                }
-            }
-        }
-    }
-
     /// Register a path with our state and configure path-specific settings.
     ///
     /// This inserts the path in the [`ConnectionState`] and [`Self::paths`].
@@ -995,7 +1252,9 @@ impl State {
             debug!(?e, "failed to set relay path idle timeout");
         }
 
-        self.set_path_status(conn_id, path, &network_path);
+        if conn_state.nat_traversal_authorized {
+            self.set_path_status(conn_id, path, &network_path);
+        }
         self.paths
             .insert_open_path(network_path.remote(), Source::Connection);
         Some(network_path)
@@ -1059,7 +1318,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_addr.clone());
+                        self.pending_open_paths.enqueue(open_addr.clone());
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1080,6 +1339,29 @@ impl State {
         }
     }
 
+    /// Selects a path Noq has already established without opening any other path.
+    ///
+    /// Before peer candidates reach the actor, applying the normal selection could disclose a
+    /// path learned from another connection. An exact path already open on this connection is
+    /// safe to select after local authorization because it has completed Noq path validation.
+    fn apply_existing_selected_path(
+        &mut self,
+        conn_id: ConnId,
+        conn_state: &ConnectionState,
+        conn: &noq::Connection,
+        selected: &transports::FourTuple,
+    ) {
+        if !conn_state.paths.values().any(|path| path == selected) {
+            return;
+        }
+        for (path_id, path_remote) in &conn_state.paths {
+            if let Some(path) = conn.path(*path_id) {
+                self.set_path_status(conn_id, &path, path_remote);
+            }
+        }
+        conn_state.path_state.record_selected(selected);
+    }
+
     /// Returns the [`transports::FourTuple] for a path.
     fn transport_tuple_for_path(&self, path: &noq::Path) -> Option<transports::FourTuple> {
         let noq_network_path = path.network_path().ok()?;
@@ -1097,6 +1379,16 @@ impl State {
             .iter()
             .map(|d| d.addr)
             .collect()
+    }
+
+    fn bootstrap_path_allowed(
+        &self,
+        authority: &BootstrapAuthority,
+        addr: &transports::Addr,
+    ) -> bool {
+        authority.endpoint_id() == self.endpoint_id
+            && (!self.defer_nat_traversal_until_authorized
+                || authority.permits(self.endpoint_id, addr))
     }
 }
 
@@ -1155,7 +1447,7 @@ pub(crate) enum RemoteStateMessage {
     /// operation with a bunch more copying.  So it should only be used for sending QUIC
     /// Initial packets.
     #[debug("SendDatagram(..)")]
-    SendDatagram(Box<TransportsSender>, OwnedTransmit),
+    SendDatagram(BootstrapAuthority, Box<TransportsSender>, OwnedTransmit),
     /// Adds an active connection to this remote endpoint.
     ///
     /// The actor will downgrade the connection to a [`noq::WeakConnectionHandle`] as soon
@@ -1165,6 +1457,11 @@ pub(crate) enum RemoteStateMessage {
     /// The actor will actively manage paths on the connection and start holepunching as needed.
     #[debug("AddConnection({})", _0.stable_id())]
     AddConnection(noq::Connection, oneshot::Sender<PathStateReceiver>),
+    /// Authorizes NAT traversal for one exact active connection.
+    AuthorizeNatTraversal {
+        connection_id: usize,
+        reply: oneshot::Sender<bool>,
+    },
     /// Asks if there is any possible path that could be used.
     ///
     /// This adds the provided transport addresses to the list of potential paths for this
@@ -1177,6 +1474,7 @@ pub(crate) enum RemoteStateMessage {
     ResolveRemote(
         BTreeSet<TransportAddr>,
         oneshot::Sender<Result<(), AddressLookupFailed>>,
+        CancellationToken,
     ),
     /// Returns information about the remote.
     ///
@@ -1232,9 +1530,32 @@ struct ConnectionState {
     ///
     /// Used for recording metrics.
     has_been_direct: bool,
+    /// Whether application admission has authorized NAT traversal for this connection.
+    nat_traversal_authorized: bool,
+    /// Whether this connection has received candidates proving the peer released its gate.
+    peer_candidates_observed: bool,
+    /// Last NAT traversal round for this exact deferred connection.
+    last_holepunch: Option<HolepunchAttempt>,
+    /// Scheduled retry for this exact deferred connection.
+    scheduled_holepunch: Option<Instant>,
 }
 
 impl ConnectionState {
+    /// Publishes the already-active bootstrap path without releasing NAT traversal.
+    ///
+    /// Noq's path zero is the path established by the immutable authority of this exact dial.
+    /// It already carries application data before admission. Recording it as selected only makes
+    /// that existing fact observable; it does not open a path, expose candidates, or holepunch.
+    fn record_deferred_bootstrap_selection(
+        &self,
+        path_id: PathId,
+        network_path: &transports::FourTuple,
+    ) {
+        if !self.nat_traversal_authorized && path_id == PathId::ZERO {
+            self.path_state.record_selected(network_path);
+        }
+    }
+
     /// Tracks an open path for the connection.
     fn add_open_path(
         &mut self,
@@ -1331,6 +1652,7 @@ impl<'a> PathSelectionContext<'a> {
             PathsSource::Live(connections) => Box::new(
                 connections
                     .values()
+                    .filter(|state| state.nat_traversal_authorized)
                     .filter_map(|state| state.handle.upgrade().map(|conn| (state, conn)))
                     .flat_map(|(state, conn)| {
                         state.paths.iter().map(move |(path_id, addr)| {
@@ -1526,5 +1848,45 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
     match maybe_stream {
         None => None,
         Some(s) => Some(s.next().await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+
+    use super::{MAX_PENDING_OPEN_PATHS, PendingOpenPaths};
+    use crate::socket::transports::FourTuple;
+
+    fn ip_path(port: u16) -> FourTuple {
+        FourTuple::Ip {
+            remote: SocketAddr::from(([192, 0, 2, 1], port)),
+            local: None,
+        }
+    }
+
+    #[test]
+    fn pending_open_paths_are_bounded_across_multi_connection_retries() {
+        let repeated_path = ip_path(1);
+        let mut pending = PendingOpenPaths::default();
+
+        // Each retry is fanned out to every connection. Two capped
+        // connections must not double the queue on every retry cycle.
+        for _ in 0..1_024 {
+            for _connection in 0..2 {
+                pending.enqueue(repeated_path.clone());
+            }
+        }
+        assert_eq!(pending.len(), 1);
+        assert!(pending.contains(&repeated_path));
+
+        // A peer can advertise many distinct unreachable candidates. Retain
+        // only a fixed working set and prefer newer observations when full.
+        for port in 2..=(MAX_PENDING_OPEN_PATHS as u16 + 10) {
+            pending.enqueue(ip_path(port));
+        }
+        assert_eq!(pending.len(), MAX_PENDING_OPEN_PATHS);
+        assert!(!pending.contains(&ip_path(1)));
+        assert!(pending.contains(&ip_path(MAX_PENDING_OPEN_PATHS as u16 + 10)));
     }
 }

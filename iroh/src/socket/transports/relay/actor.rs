@@ -137,6 +137,9 @@ struct ActiveRelayActor {
     url: RelayUrl,
     /// Builder which can repeatedly build a relay client.
     relay_client_builder: relay::client::ClientBuilder,
+    /// Shared relay configuration. Connection-scoped credentials are read
+    /// immediately before every dial so a reconnect uses the latest token.
+    relay_map: RelayMap,
     /// Whether or not this is the home relay server.
     ///
     /// The home relay server needs to maintain it's connection to the relay server, even if
@@ -193,6 +196,7 @@ struct ActiveRelayActorOptions {
     relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
     relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
     connection_opts: RelayConnectionOptions,
+    relay_map: RelayMap,
     stop_token: CancellationToken,
     metrics: Arc<SocketMetrics>,
     my_relay: HomeRelayWatch,
@@ -207,7 +211,6 @@ struct RelayConnectionOptions {
     proxy_url: Option<Url>,
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
-    auth_token: Option<String>,
 }
 
 /// Possible reasons for a failed relay connection.
@@ -265,6 +268,7 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             relay_datagrams_recv,
             connection_opts,
+            relay_map,
             stop_token,
             metrics,
             my_relay,
@@ -277,6 +281,7 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             url,
             relay_client_builder,
+            relay_map,
             is_home_relay: false,
             inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
             stop_token,
@@ -296,7 +301,6 @@ impl ActiveRelayActor {
             proxy_url,
             prefer_ipv6,
             tls_config,
-            auth_token,
         } = opts;
 
         let mut builder = relay::client::ClientBuilder::new(
@@ -311,9 +315,6 @@ impl ActiveRelayActor {
             builder = builder.proxy_url(proxy_url);
         }
 
-        if let Some(token) = auth_token {
-            builder = builder.auth_token(token);
-        }
         builder
     }
 
@@ -485,7 +486,14 @@ impl ActiveRelayActor {
     /// forever.
     // This is using `impl Future` to return a future without a reference to self.
     fn dial_relay(&self) -> impl Future<Output = Result<Client, DialError>> + use<> {
-        let client_builder = self.relay_client_builder.clone();
+        let mut client_builder = self.relay_client_builder.clone();
+        if let Some(token) = self
+            .relay_map
+            .get(&self.url)
+            .and_then(|config| config.auth_token.clone())
+        {
+            client_builder = client_builder.auth_token(token);
+        }
         async move {
             match time::timeout(CONNECT_TIMEOUT, client_builder.connect()).await {
                 Ok(Ok(client)) => Ok(client),
@@ -829,6 +837,13 @@ impl ConnectedRelayState {
 }
 
 pub(super) enum RelayActorMessage {
+    /// The shared relay map changed for this URL. Restart an active client so
+    /// connection-scoped configuration such as its auth token takes effect.
+    RelayConfigChanged {
+        url: RelayUrl,
+        present: bool,
+        done: oneshot::Sender<()>,
+    },
     MaybeCloseRelaysOnRebind,
     NetworkChange {
         report: Report,
@@ -1078,6 +1093,10 @@ impl RelayActor {
 
     async fn handle_msg(&mut self, msg: RelayActorMessage) {
         match msg {
+            RelayActorMessage::RelayConfigChanged { url, present, done } => {
+                self.on_relay_config_changed(url, present);
+                let _ = done.send(());
+            }
             RelayActorMessage::NetworkChange { report } => {
                 self.on_network_change(report).await;
             }
@@ -1088,6 +1107,48 @@ impl RelayActor {
                 self.check_connection_after_network_change().await;
             }
         }
+    }
+
+    fn on_relay_config_changed(&mut self, url: RelayUrl, present: bool) {
+        let was_home = self
+            .config
+            .my_relay
+            .get()
+            .as_ref()
+            .is_some_and(|status| status.url() == &url);
+        if present {
+            // Connection-scoped credentials authenticate a relay dial. Keep
+            // an established route alive when its configuration changes; the
+            // active actor reads the latest configuration on its next dial.
+            // This prevents a receiving endpoint from disappearing from the
+            // relay between token refresh and replacement authentication.
+            if self
+                .active_relays
+                .get(&url)
+                .is_some_and(|handle| handle.inbox_addr.is_closed())
+            {
+                self.active_relays.remove(&url);
+            }
+            if was_home && !self.active_relays.contains_key(&url) {
+                self.active_relay_handle(url);
+            }
+            self.log_active_relay();
+            return;
+        }
+
+        if let Some(handle) = self.active_relays.remove(&url) {
+            handle.stop_token.cancel();
+        }
+
+        if was_home {
+            // Keep advertising the last known home relay until net-report has
+            // selected its replacement. Clearing it here publishes a transient
+            // endpoint address without any relay, even though re-STUN is already
+            // scheduled by the socket actor.
+            self.log_active_relay();
+            return;
+        }
+        self.log_active_relay();
     }
 
     /// Sends datagrams to the correct [`ActiveRelayActor`], or returns a future.
@@ -1233,11 +1294,6 @@ impl RelayActor {
     fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
         debug!(?url, "Adding relay connection");
 
-        let auth_token = self
-            .config
-            .relay_map
-            .get(&url)
-            .and_then(|cfg| cfg.auth_token.clone());
         let connection_opts = RelayConnectionOptions {
             secret_key: self.config.secret_key.clone(),
             #[cfg(not(wasm_browser))]
@@ -1245,7 +1301,6 @@ impl RelayActor {
             proxy_url: self.config.proxy_url.clone(),
             prefer_ipv6: self.config.ipv6_reported.clone(),
             tls_config: self.config.tls_config.clone(),
-            auth_token,
         };
 
         // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
@@ -1253,14 +1308,16 @@ impl RelayActor {
         let (prio_inbox_tx, prio_inbox_rx) = mpsc::channel(32);
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
+        let stop_token = self.cancel_token.child_token();
         let opts = ActiveRelayActorOptions {
-            url,
+            url: url.clone(),
             prio_inbox_: prio_inbox_rx,
             inbox: inbox_rx,
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
-            stop_token: self.cancel_token.child_token(),
+            relay_map: self.config.relay_map.clone(),
+            stop_token: stop_token.clone(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
         };
@@ -1275,6 +1332,7 @@ impl RelayActor {
             prio_inbox_addr: prio_inbox_tx,
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
+            stop_token,
         };
         self.log_active_relay();
         handle
@@ -1329,8 +1387,12 @@ impl RelayActor {
         self.active_relays
             .retain(|_url, handle| !handle.inbox_addr.is_closed());
 
-        // Make sure home relay exists
-        if let Some(status) = self.config.my_relay.get() {
+        // Make sure the configured home relay exists. A removed home remains
+        // published until net-report selects its replacement, but must not be
+        // restarted from a RelayConfig that is no longer in the map.
+        if let Some(status) = self.config.my_relay.get()
+            && self.config.relay_map.get(status.url()).is_some()
+        {
             self.active_relay_handle(status.url().clone());
         }
         self.log_active_relay();
@@ -1372,6 +1434,7 @@ struct ActiveRelayHandle {
     prio_inbox_addr: mpsc::Sender<ActiveRelayPrioMessage>,
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,
+    stop_token: CancellationToken,
 }
 
 /// A single datagram received from a relay server.
@@ -1393,7 +1456,7 @@ mod tests {
 
     use iroh_base::{EndpointId, RelayUrl, SecretKey};
     use iroh_relay::{
-        PingTracker,
+        PingTracker, RelayMap,
         protos::relay::Datagrams,
         tls::{CaTlsConfig, default_provider},
     };
@@ -1423,7 +1486,7 @@ mod tests {
         span: tracing::Span,
     ) -> AbortOnDropHandle<()> {
         let opts = ActiveRelayActorOptions {
-            url,
+            url: url.clone(),
             prio_inbox_: prio_inbox_rx,
             inbox: inbox_rx,
             relay_datagrams_send,
@@ -1436,8 +1499,8 @@ mod tests {
                 tls_config: CaTlsConfig::insecure_skip_verify()
                     .client_config(default_provider())
                     .expect("infallible"),
-                auth_token: None,
             },
+            relay_map: RelayMap::from_iter([url.clone()]),
             stop_token,
             metrics: Default::default(),
             my_relay: Default::default(),

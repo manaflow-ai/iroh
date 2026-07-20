@@ -3159,8 +3159,7 @@ checksum = "38bf9645c8b145698bb0b18a4637dcacbc421ea49bef2317e4fd8065a387cf21"
 [[package]]
 name = "noq"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bf95190af1bd4a00a10e8255ca0c8ddd9e9a9f5e79151d7a7eb6d56aff5dc89"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -3181,8 +3180,7 @@ dependencies = [
 [[package]]
 name = "noq-proto"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa6c890013591e709a3e45dd53501351b7e27e7ff3c7e9fc3dce43e300e7e9d3"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "aes-gcm",
  "aws-lc-rs",
@@ -3212,8 +3210,7 @@ dependencies = [
 [[package]]
 name = "noq-udp"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3137a52df66c20090a889828d1c655f21f52294cba64e5c4fbb04fc83eee7c8e"
+source = "git+https://github.com/manaflow-ai/noq?rev=2271bbc25890f9577d2ce9bd0bb0f872af32e105#2271bbc25890f9577d2ce9bd0bb0f872af32e105"
 dependencies = [
  "cfg_aliases",
  "libc",
@@ -3619,9 +3616,9 @@ dependencies = [
 
 [[package]]
 name = "plist"
-version = "1.9.0"
+version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "092791278e026273c1b65bbdcfbba3a300f2994c896bd01ab01da613c29c46f1"
+checksum = "7da1d65da6dd5d1e44199ac0f58712d241c0f439f80adea8924d832384087f85"
 dependencies = [
  "base64",
  "indexmap",
@@ -3838,9 +3835,9 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
 ]

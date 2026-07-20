@@ -46,8 +46,10 @@ use crate::{
         },
     },
     socket::{
-        RemoteStateActorStoppedError,
-        remote_map::{PathEventStream, PathList, PathListStream, PathStateReceiver},
+        NatTraversalAuthorizer, RemoteStateActorStoppedError,
+        remote_map::{
+            PathEventStream, PathList, PathListStream, PathStateReceiver, ResolvedRemote,
+        },
         transports::{self, LocalTransportAddr},
     },
 };
@@ -165,8 +167,13 @@ impl Incoming {
         self,
         server_config: Arc<ServerConfig>,
     ) -> Result<Accepting, ConnectionError> {
+        let defer_nat_traversal = self
+            .ep
+            .inner
+            .static_config
+            .defer_nat_traversal_until_authorized;
         self.inner
-            .accept_with(server_config.to_inner_arc())
+            .accept_with(server_config.to_inner_arc(defer_nat_traversal))
             .map(|conn| Accepting::new(conn, self.ep))
     }
 
@@ -343,9 +350,13 @@ fn conn_from_noq_conn(
     // Check hooks
     let inner = ep.inner.clone();
     Ok(async move {
-        let paths = fut.await?;
+        let (paths, nat_traversal_authorizer) = fut.await?;
         let conn = Connection {
-            data: HandshakeCompletedData { info, paths },
+            data: HandshakeCompletedData {
+                info,
+                paths,
+                nat_traversal_authorizer,
+            },
             inner: conn,
         };
 
@@ -421,6 +432,8 @@ pub struct Connecting {
     ep: Endpoint,
     /// `Some(remote_id)` if this is an outgoing connection, `None` if this is an incoming conn
     remote_endpoint_id: EndpointId,
+    /// Keeps this dial's immutable bootstrap authority registered while Initials may be sent.
+    dial_attempt: ResolvedRemote,
 }
 
 type RegisterWithSocketFut = BoxFuture<Result<Connection, ConnectingError>>;
@@ -480,12 +493,14 @@ impl Connecting {
         inner: noq::Connecting,
         ep: Endpoint,
         remote_endpoint_id: EndpointId,
+        dial_attempt: ResolvedRemote,
     ) -> Self {
         Self {
             inner,
             ep,
             remote_endpoint_id,
             register_with_socket: None,
+            dial_attempt,
         }
     }
 
@@ -526,13 +541,22 @@ impl Connecting {
     /// [`RecvStream::is_0rtt`]: noq::RecvStream::is_0rtt
     #[allow(clippy::result_large_err)]
     pub fn into_0rtt(self) -> Result<OutgoingZeroRttConnection, Connecting> {
-        match self.inner.into_0rtt() {
+        let Self {
+            inner,
+            register_with_socket,
+            ep,
+            remote_endpoint_id,
+            dial_attempt,
+        } = self;
+        match inner.into_0rtt() {
             Ok((noq_conn, zrtt_accepted)) => {
                 let accepted: BoxFuture<_> = Box::pin({
                     let noq_conn = noq_conn.clone();
                     async move {
+                        // Noq can retransmit the Initial until this handshake completes.
+                        let _dial_attempt = dial_attempt;
                         let accepted = zrtt_accepted.await;
-                        let conn = conn_from_noq_conn(noq_conn, &self.ep)?.await?;
+                        let conn = conn_from_noq_conn(noq_conn, &ep)?.await?;
                         Ok(match accepted {
                             true => ZeroRttStatus::Accepted(conn),
                             false => ZeroRttStatus::Rejected(conn),
@@ -545,7 +569,13 @@ impl Connecting {
                     data: OutgoingZeroRttData { accepted },
                 })
             }
-            Err(inner) => Err(Self { inner, ..self }),
+            Err(inner) => Err(Self {
+                inner,
+                register_with_socket,
+                ep,
+                remote_endpoint_id,
+                dial_attempt,
+            }),
         }
     }
 
@@ -745,6 +775,7 @@ pub struct Connection<State: ConnectionState = HandshakeCompleted> {
 pub struct HandshakeCompletedData {
     info: StaticInfo,
     paths: PathStateReceiver,
+    nat_traversal_authorizer: NatTraversalAuthorizer,
 }
 
 /// Static info from a completed TLS handshake.
@@ -1111,6 +1142,19 @@ impl<T: ConnectionState> Connection<T> {
 }
 
 impl Connection<HandshakeCompleted> {
+    /// Authorizes NAT traversal for this exact connection.
+    ///
+    /// This is idempotent. It has an effect only when the endpoint was built with
+    /// [`Builder::defer_nat_traversal_until_authorized`](super::Builder::defer_nat_traversal_until_authorized).
+    /// The connection's relay or explicitly supplied initial direct path remains usable
+    /// before this call succeeds.
+    ///
+    /// Returns an error without authorizing the underlying connection when its endpoint,
+    /// remote-state actor, or exact connection state is no longer available.
+    pub async fn authorize_nat_traversal(&self) -> Result<(), NatTraversalAuthorizationError> {
+        self.data.nat_traversal_authorizer.authorize().await
+    }
+
     /// Extracts the ALPN protocol from the peer's handshake data.
     pub fn alpn(&self) -> &[u8] {
         &self.data.info.alpn
@@ -1195,6 +1239,12 @@ impl Connection<HandshakeCompleted> {
         }
     }
 }
+
+/// Error returned when NAT traversal cannot be authorized for the exact connection.
+#[stack_error(add_meta, derive)]
+#[error("connection state unavailable for NAT traversal authorization")]
+#[derive(Clone)]
+pub struct NatTraversalAuthorizationError;
 
 impl Connection<IncomingZeroRtt> {
     /// Extracts the ALPN protocol from the peer's handshake data.
