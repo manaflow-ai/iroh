@@ -2045,7 +2045,7 @@ mod tests {
     use noq::PathStats;
     use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha8Rng;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::{Notify, mpsc, oneshot};
     use tracing::{Instrument, debug_span, error_span, info, info_span, instrument};
 
     use super::Endpoint;
@@ -4666,6 +4666,7 @@ mod tests {
                 recv.read_exact(&mut after).await.anyerr()?;
                 assert_eq!(&after, b"after");
                 send.write_all(&after).await.anyerr()?;
+
                 send.finish().anyerr()?;
                 let _ = client_done_rx.await;
                 Ok(())
@@ -4712,6 +4713,177 @@ mod tests {
         recv.read_exact(&mut echoed_after).await.anyerr()?;
         assert_eq!(&echoed_after, b"after");
         let _ = client_done_tx.send(());
+
+        server_task.await.anyerr()??;
+        client.close().await;
+        server.close().await;
+        Ok(())
+    }
+
+    /// Updating the receiving endpoint's connection-scoped relay token must
+    /// not remove its working home-relay route before the relay expires the
+    /// old session. The next dial must then use the refreshed token while the
+    /// existing QUIC connection survives the relay reconnect.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_home_relay_token_rotation_preserves_receiving_connection() -> Result {
+        const TOKEN_A: &str = "token-a";
+        const TOKEN_B: &str = "token-b";
+
+        #[derive(Debug)]
+        struct DelayedRotatingTokenAccess {
+            expected: Arc<RwLock<String>>,
+            observed: mpsc::UnboundedSender<(EndpointId, String)>,
+            disconnected: mpsc::UnboundedSender<EndpointId>,
+            replacement_gate: Arc<Notify>,
+        }
+
+        impl iroh_relay::server::AccessControl for DelayedRotatingTokenAccess {
+            async fn on_connect(&self, request: &iroh_relay::server::ClientRequest) -> Access {
+                let token = request.auth_token().unwrap_or_default();
+                let _ = self.observed.send((request.endpoint_id(), token.clone()));
+                if token == TOKEN_B {
+                    self.replacement_gate.notified().await;
+                }
+                if token == *self.expected.read().expect("token lock poisoned") {
+                    Access::Allow
+                } else {
+                    Access::Deny { reason: None }
+                }
+            }
+
+            fn on_disconnect(
+                &self,
+                endpoint_id: EndpointId,
+                _connection_id: iroh_relay::server::ConnectionId,
+            ) {
+                let _ = self.disconnected.send(endpoint_id);
+            }
+        }
+
+        let expected = Arc::new(RwLock::new(TOKEN_A.to_string()));
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let (disconnected_tx, mut disconnected_rx) = mpsc::unbounded_channel();
+        let replacement_gate = Arc::new(Notify::new());
+        let access = Arc::new(DelayedRotatingTokenAccess {
+            expected: expected.clone(),
+            observed: observed_tx,
+            disconnected: disconnected_tx,
+            replacement_gate: replacement_gate.clone(),
+        });
+        let (_relay_map, relay_url, relay_server) =
+            run_relay_server_with_access(false, access).await?;
+        let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
+            .with_auth_token(TOKEN_A)
+            .into();
+
+        let server = Endpoint::builder(presets::Minimal)
+            .alpns(vec![TEST_ALPN.to_vec()])
+            .relay_mode(RelayMode::Custom(initial_map.clone()))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Custom(initial_map))
+            .clear_ip_transports()
+            .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+            .bind()
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for server relay")?;
+        tokio::time::timeout(Duration::from_secs(5), client.online())
+            .await
+            .std_context("waiting for client relay")?;
+
+        let server_task: tokio::task::JoinHandle<Result<()>> = {
+            let server = server.clone();
+            tokio::spawn(async move {
+                let connection = server.accept().await.anyerr()?.await.anyerr()?;
+                let (mut send, mut recv) = connection.accept_bi().await.anyerr()?;
+                for expected in [b"before".as_slice(), b"during".as_slice(), b"after".as_slice()] {
+                    let mut received = vec![0; expected.len()];
+                    recv.read_exact(&mut received).await.anyerr()?;
+                    assert_eq!(received, expected);
+                    send.write_all(&received).await.anyerr()?;
+                }
+                send.finish().anyerr()?;
+                Ok(())
+            })
+        };
+
+        let connection = client.connect(server.addr(), TEST_ALPN).await?;
+        assert!(connection.paths().iter().all(|path| path.is_relay()));
+        let connection_id = connection.stable_id();
+        let (mut send, mut recv) = connection.open_bi().await.anyerr()?;
+        send.write_all(b"before").await.anyerr()?;
+        let mut echoed_before = [0; 6];
+        recv.read_exact(&mut echoed_before).await.anyerr()?;
+        assert_eq!(&echoed_before, b"before");
+
+        *expected.write().expect("token lock poisoned") = TOKEN_B.to_string();
+        server
+            .insert_relay(
+                relay_url.clone(),
+                Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
+            )
+            .await;
+
+        // Give a break-before-make implementation time to cancel and
+        // unregister the existing receiver. A continuity-preserving update
+        // leaves this wait pending because the old connection remains live.
+        let _ = tokio::time::timeout(Duration::from_millis(500), async {
+            while let Some(endpoint_id) = disconnected_rx.recv().await {
+                if endpoint_id == server.id() {
+                    return;
+                }
+            }
+        })
+        .await;
+
+        send.write_all(b"during").await.anyerr()?;
+        let mut echoed_during = [0; 6];
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            recv.read_exact(&mut echoed_during),
+        )
+        .await
+        .std_context("receiver disappeared while replacement relay auth was pending")?
+        .anyerr()?;
+        assert_eq!(&echoed_during, b"during");
+
+        // Simulate relay-side JWT expiry. The active actor must reconnect
+        // with the latest token from the shared relay map.
+        assert!(
+            relay_server
+                .relay_service()
+                .expect("relay service")
+                .clients()
+                .disconnect(server.id(), None)
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some((endpoint_id, token)) = observed_rx.recv().await {
+                if endpoint_id == server.id() && token == TOKEN_B {
+                    return;
+                }
+            }
+            panic!("relay access-control observation channel closed");
+        })
+        .await
+        .std_context("waiting for receiver to redial with rotated token")?;
+        replacement_gate.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), server.online())
+            .await
+            .std_context("waiting for receiver relay to reconnect")?;
+
+        assert_eq!(connection.stable_id(), connection_id);
+        assert_eq!(connection.close_reason(), None);
+        send.write_all(b"after").await.anyerr()?;
+        send.finish().anyerr()?;
+        let mut echoed_after = [0; 5];
+        recv.read_exact(&mut echoed_after).await.anyerr()?;
+        assert_eq!(&echoed_after, b"after");
 
         server_task.await.anyerr()??;
         client.close().await;
