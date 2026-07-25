@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
     sync::Arc,
@@ -109,6 +109,42 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// in a high frequency, and to keep data about previous path around for subsequent connections.
 const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often to inspect the selected direct path for one-way silence.
+///
+/// cmux sessions died about 2.2s into the field black hole, so the detector needs a
+/// substantially finer tick to beat that failure scale.
+const SELECTED_PATH_HEALTH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Minimum one-way silence before the selected direct path is demoted.
+///
+/// cmux sessions died about 2.2s into the field black hole, so the floor must detect a
+/// genuinely stalled path before that failure scale while still allowing normal jitter.
+const SELECTED_PATH_STALL_FLOOR: Duration = Duration::from_secs(1);
+
+/// Minimum transmissions without a receive before treating a selected path as stalled.
+///
+/// cmux sessions died about 2.2s into the field black hole; requiring several attempted
+/// datagrams lets us detect active stalls before then without ever penalizing an idle path.
+const SELECTED_PATH_STALL_MIN_DATAGRAMS: u64 = 3;
+
+/// Initial quarantine after a selected path is demoted.
+///
+/// cmux sessions died about 2.2s into the field black hole, so a failed path must stay
+/// excluded long enough that tier dominance cannot immediately recreate that failure.
+const PATH_QUARANTINE_BASE: Duration = Duration::from_secs(5);
+
+/// Maximum quarantine after repeated selected-path demotions.
+///
+/// cmux sessions died about 2.2s into the field black hole, so repeated failed re-probes
+/// need bounded exponential backoff instead of repeatedly exposing sessions to that window.
+const PATH_QUARANTINE_MAX: Duration = Duration::from_secs(300);
+
+/// Healthy interval after which a later demotion starts a fresh backoff ladder.
+///
+/// cmux sessions died about 2.2s into the field black hole; retaining strikes across nearby
+/// failures protects sessions, while resetting after ten minutes avoids permanent suspicion.
+const PATH_QUARANTINE_STRIKE_RESET: Duration = Duration::from_secs(600);
+
 /// A stream of events from all paths for all connections.
 ///
 /// The connection is identified using [`ConnId`].  The event `Err` variant happens when the
@@ -183,10 +219,10 @@ struct State {
 
     /// The path we currently consider the preferred path to the remote endpoint.
     ///
-    /// **We expect this path to work.** If we become aware this path is broken then it is
-    /// set back to `None`.  Having a selected path does not mean we may not be able to get
-    /// a better path: e.g. when the selected path is a relay path we still need to trigger
-    /// holepunching regularly.
+    /// **We expect this path to work.** The selected-path health check removes and quarantines
+    /// it before selecting a fallback when active transmissions get no response. Having a
+    /// selected path does not mean we may not be able to get a better path: e.g. when the
+    /// selected path is a relay path we still need to trigger holepunching regularly.
     ///
     /// We only select a path once the path is functional in Noq.
     selected_path: Option<transports::FourTuple>,
@@ -198,6 +234,10 @@ struct State {
     ///
     /// They failed to open because we did not have enough CIDs issued by the remote.
     pending_open_paths: PendingOpenPaths,
+    /// Remote addresses temporarily excluded after selected-path health demotions.
+    quarantine: BTreeMap<transports::Addr, QuarantineEntry>,
+    /// Time of the next selected direct-path health check, if the detector is armed.
+    next_health_check: Option<Instant>,
 
     // Internal state - address lookup
     //
@@ -209,6 +249,13 @@ struct State {
 
     /// The path selector used to pick the preferred path among the candidates.
     path_selector: Arc<dyn PathSelector>,
+}
+
+#[derive(Debug)]
+struct QuarantineEntry {
+    strikes: u32,
+    until: Instant,
+    last_demoted: Instant,
 }
 
 impl RemoteStateActor {
@@ -242,6 +289,8 @@ impl RemoteStateActor {
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
                 pending_open_paths: PendingOpenPaths::default(),
+                quarantine: BTreeMap::new(),
+                next_health_check: None,
                 address_lookup_stream: None,
                 address_lookup_cancellations: FuturesUnordered::new(),
                 path_selector,
@@ -297,6 +346,23 @@ impl RemoteStateActor {
         n0_future::pin!(check_connections);
 
         loop {
+            let health_check_needed = self
+                .state
+                .selected_path
+                .as_ref()
+                .is_some_and(|path| !path.is_relay())
+                && self
+                    .connections
+                    .values()
+                    .any(|state| state.nat_traversal_authorized);
+            if health_check_needed {
+                self.state
+                    .next_health_check
+                    .get_or_insert_with(|| Instant::now() + SELECTED_PATH_HEALTH_INTERVAL);
+            } else {
+                self.state.next_health_check = None;
+            }
+
             let scheduled_path_open = match self.state.scheduled_open_path {
                 Some(when) => MaybeFuture::Some(time::sleep_until(when)),
                 None => MaybeFuture::None,
@@ -308,6 +374,24 @@ impl RemoteStateActor {
                 None => MaybeFuture::None,
             };
             n0_future::pin!(scheduled_hp);
+            let scheduled_health_check = match self.state.next_health_check {
+                Some(when) => MaybeFuture::Some(time::sleep_until(when)),
+                None => MaybeFuture::None,
+            };
+            n0_future::pin!(scheduled_health_check);
+            let now = Instant::now();
+            let next_quarantine_expiry = self
+                .state
+                .quarantine
+                .values()
+                .filter(|entry| entry.until > now)
+                .map(|entry| entry.until)
+                .min();
+            let scheduled_quarantine_wake = match next_quarantine_expiry {
+                Some(when) => MaybeFuture::Some(time::sleep_until(when)),
+                None => MaybeFuture::None,
+            };
+            n0_future::pin!(scheduled_quarantine_wake);
             if !self.is_idle(&inbox) {
                 idle_timeout
                     .as_mut()
@@ -383,6 +467,24 @@ impl RemoteStateActor {
                         self.state.scheduled_holepunch = None;
                     }
                     self.trigger_holepunching_for(conn_id);
+                }
+                _ = &mut scheduled_health_check => {
+                    let now = Instant::now();
+                    self.state.next_health_check =
+                        Some(now + SELECTED_PATH_HEALTH_INTERVAL);
+                    self.check_selected_path_health(now);
+                }
+                _ = &mut scheduled_quarantine_wake => {
+                    let now = Instant::now();
+                    self.state.quarantine.retain(|_, entry| {
+                        entry.until > now
+                            || now.duration_since(entry.last_demoted)
+                                <= PATH_QUARANTINE_STRIKE_RESET
+                    });
+                    // Expiry is the deliberate re-probe: the normal selector may promote
+                    // this higher-tier path again, and another active stall will increase
+                    // its backoff without waiting for noq's 15s path-idle timeout.
+                    self.select_path();
                 }
                 Some(item) = maybe_next(self.state.address_lookup_stream.as_mut()), if self.state.address_lookup_stream.is_some() => {
                     self.state.handle_address_lookup_item(item);
@@ -503,6 +605,7 @@ impl RemoteStateActor {
                 peer_candidates_observed: nat_traversal_authorized,
                 last_holepunch: None,
                 scheduled_holepunch: None,
+                selected_health: None,
             })
             .into_mut();
 
@@ -896,6 +999,203 @@ impl RemoteStateActor {
         }
     }
 
+    /// Detects active application traffic pinned to a silent selected direct path.
+    ///
+    /// noq exempts keepalives from path scheduling, so connection liveness alone cannot
+    /// distinguish the field failure: data and ACKs can remain pinned to an
+    /// `Available` direct path while a healthy `Backup` relay sits unused.
+    fn check_selected_path_health(&mut self, now: Instant) {
+        let Some(selected) = self.state.selected_path.clone() else {
+            for conn_state in self.connections.values_mut() {
+                conn_state.selected_health = None;
+            }
+            return;
+        };
+
+        // Relay-only deployments are intentionally untouched. A relay is already the
+        // fallback tier, so there is no lower-risk path for this detector to choose.
+        if selected.is_relay() {
+            for conn_state in self.connections.values_mut() {
+                conn_state.selected_health = None;
+            }
+            return;
+        }
+
+        let mut should_demote = false;
+        for conn_state in self.connections.values_mut() {
+            if !conn_state.nat_traversal_authorized {
+                continue;
+            }
+            let Some(conn) = conn_state.handle.upgrade() else {
+                conn_state.selected_health = None;
+                continue;
+            };
+            let Some(path_id) = conn_state
+                .paths
+                .iter()
+                .find_map(|(path_id, path)| (path == &selected).then_some(*path_id))
+            else {
+                conn_state.selected_health = None;
+                continue;
+            };
+            let Some(stats) = conn.path_stats(path_id) else {
+                conn_state.selected_health = None;
+                continue;
+            };
+
+            let tracker_matches = conn_state
+                .selected_health
+                .as_ref()
+                .is_some_and(|health| health.network_path == selected && health.path_id == path_id);
+            if !tracker_matches {
+                // A new path selection needs a baseline tick: historical counters cannot
+                // prove that transmission progressed while this exact path was selected.
+                conn_state.selected_health = Some(SelectedPathHealth {
+                    network_path: selected.clone(),
+                    path_id,
+                    last_udp_tx: stats.udp_tx.datagrams,
+                    last_udp_rx: stats.udp_rx.datagrams,
+                    stalled_since: None,
+                    stalled_tx: 0,
+                });
+                continue;
+            }
+
+            let health = conn_state
+                .selected_health
+                .as_mut()
+                .expect("selected-path health tracker was checked above");
+            if stats.udp_rx.datagrams > health.last_udp_rx {
+                // Any receive progress proves the path still carries peer traffic, even
+                // if loss or a busy receiver made the preceding ticks look one-way.
+                health.stalled_since = None;
+                health.stalled_tx = 0;
+            } else if stats.udp_tx.datagrams > health.last_udp_tx {
+                // Transmission progress is required to begin or extend a stall. An idle
+                // selected path therefore never accumulates evidence or gets demoted.
+                health.stalled_tx += stats.udp_tx.datagrams - health.last_udp_tx;
+                health.stalled_since.get_or_insert(now);
+            }
+            health.last_udp_tx = stats.udp_tx.datagrams;
+            health.last_udp_rx = stats.udp_rx.datagrams;
+
+            let stall_threshold =
+                std::cmp::max(SELECTED_PATH_STALL_FLOOR, stats.rtt.saturating_mul(3));
+            if health
+                .stalled_since
+                .is_some_and(|since| now.duration_since(since) >= stall_threshold)
+                && health.stalled_tx >= SELECTED_PATH_STALL_MIN_DATAGRAMS
+            {
+                // Never demote the selected path unless this same connection retains
+                // another eligible open path. This prevents health detection from
+                // leaving a connection with zero paths the selector is allowed to use.
+                let has_alternative = conn_state.paths.iter().any(|(other_id, other)| {
+                    *other_id != path_id && !self.state.quarantine_active(&other.remote(), now)
+                });
+                should_demote |= has_alternative;
+            }
+        }
+
+        if should_demote {
+            self.demote_selected_path(now);
+        }
+    }
+
+    /// Quarantines the silent selection, closes its paths, and immediately applies the
+    /// best eligible fallback.
+    ///
+    /// This closes the *path*, never the connection: it is the same abandon that noq's
+    /// per-path idle timeout would perform 15s later, moved to the moment the stall is
+    /// detected.
+    fn demote_selected_path(&mut self, now: Instant) {
+        let Some(dead) = self.state.selected_path.take() else {
+            return;
+        };
+
+        let remote_addr = dead.remote();
+        let (strikes, backoff) = {
+            let entry = self
+                .state
+                .quarantine
+                .entry(remote_addr)
+                .or_insert(QuarantineEntry {
+                    strikes: 0,
+                    until: now,
+                    last_demoted: now,
+                });
+            if now.duration_since(entry.last_demoted) > PATH_QUARANTINE_STRIKE_RESET {
+                entry.strikes = 0;
+            }
+            entry.strikes = entry.strikes.saturating_add(1);
+            entry.last_demoted = now;
+            let factor = 1u32 << entry.strikes.saturating_sub(1).min(6);
+            let backoff = PATH_QUARANTINE_BASE
+                .saturating_mul(factor)
+                .min(PATH_QUARANTINE_MAX);
+            entry.until = now + backoff;
+            (entry.strikes, backoff)
+        };
+
+        event!(
+            target: "iroh::_events::path::demoted",
+            Level::DEBUG,
+            remote = %self.state.endpoint_id.fmt_short(),
+            network_path = %dead,
+            strikes,
+            backoff_secs = backoff.as_secs(),
+        );
+
+        for conn_state in self.connections.values_mut() {
+            conn_state.selected_health = None;
+        }
+
+        // Re-routing selection alone is not enough to revive ordered streams: STREAM
+        // frames already in flight on the dead path live in that path's packet number
+        // space, and with no ACKs arriving on the path they are never declared lost
+        // (ACK-threshold loss detection needs receipts; PTO only re-probes the same
+        // path). Receivers then head-of-line block behind the missing offsets until
+        // noq's path-idle timeout abandons the path ~15s later. Closing the path
+        // abandons it NOW: all its outstanding data is declared lost and requeued, so
+        // it retransmits over the fallback immediately, and the peer reacts to our
+        // PATH_ABANDON by dropping the path too, unpinning its own data and ACKs
+        // within one round trip.
+        for conn_state in self.connections.values() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            let Some(path_id) = conn_state
+                .paths
+                .iter()
+                .find_map(|(path_id, path)| (path == &dead).then_some(*path_id))
+            else {
+                continue;
+            };
+            let Some(path) = conn.path(path_id) else {
+                continue;
+            };
+            match path.close() {
+                Ok(()) => {}
+                // Already closed, e.g. by the peer's own demotion racing ours.
+                Err(noq_proto::ClosePathError::ClosedPath) => {}
+                // The detector's alternative-path guard makes this unreachable for the
+                // connection that tripped it, but another connection may hold the dead
+                // tuple as its only path. Leave that path to the idle timeout: closing
+                // a connection's last path would be a connection decision, which
+                // demotion must never make.
+                Err(noq_proto::ClosePathError::LastOpenPath) => {}
+                Err(noq_proto::ClosePathError::MultipathNotNegotiated) => {
+                    error!("multipath not negotiated");
+                }
+            }
+        }
+
+        // Selection excludes the quarantined direct path, so the best remaining path
+        // (typically the relay) becomes Available. The QUIC connection stays open
+        // throughout; the abandoned path is re-probed later via the existing
+        // holepunching/upgrade machinery once its quarantine expires.
+        self.select_path();
+    }
+
     /// Selects the preferred path by invoking the configured [`PathSelector`].
     ///
     /// The selected path is added to any connections which do not yet have it.  Any unused
@@ -904,7 +1204,12 @@ impl RemoteStateActor {
     fn select_path(&mut self) {
         let current_path = self.state.selected_path.as_ref();
         let selected_addr = {
-            let ctx = PathSelectionContext::new(current_path, &self.connections);
+            let ctx = PathSelectionContext::new(
+                current_path,
+                &self.connections,
+                &self.state.quarantine,
+                Instant::now(),
+            );
             self.state.path_selector.select(&ctx).selected().cloned()
         };
 
@@ -1060,6 +1365,12 @@ impl RemoteStateActor {
 }
 
 impl State {
+    fn quarantine_active(&self, addr: &transports::Addr, now: Instant) -> bool {
+        self.quarantine
+            .get(addr)
+            .is_some_and(|entry| entry.until > now)
+    }
+
     /// Handles [`RemoteStateMessage::SendDatagram`].
     async fn handle_msg_send_datagram(
         &mut self,
@@ -1538,6 +1849,22 @@ struct ConnectionState {
     last_holepunch: Option<HolepunchAttempt>,
     /// Scheduled retry for this exact deferred connection.
     scheduled_holepunch: Option<Instant>,
+    /// Health baseline for the currently-selected direct path.
+    selected_health: Option<SelectedPathHealth>,
+}
+
+#[derive(Debug)]
+struct SelectedPathHealth {
+    network_path: transports::FourTuple,
+    path_id: PathId,
+    /// Cumulative `udp_tx.datagrams` at the previous detector tick.
+    last_udp_tx: u64,
+    /// Cumulative `udp_rx.datagrams` at the previous detector tick.
+    last_udp_rx: u64,
+    /// First tick where transmission progressed without any receive progress.
+    stalled_since: Option<Instant>,
+    /// Datagrams transmitted since `stalled_since`.
+    stalled_tx: u64,
 }
 
 impl ConnectionState {
@@ -1597,12 +1924,15 @@ impl ConnectionState {
 /// State of the endpoint relevant for path selection.
 ///
 /// Constructed by the endpoint and passed to [`PathSelector::select`].  Borrows from
-/// the endpoint's internal data.
+/// the endpoint's internal data. Production contexts transparently exclude remote
+/// addresses whose selected-path health demotion quarantine is still active.
 #[derive(Debug)]
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 pub struct PathSelectionContext<'a> {
     current: Option<&'a transports::FourTuple>,
     source: PathsSource<'a>,
+    quarantine: Option<&'a BTreeMap<transports::Addr, QuarantineEntry>>,
+    now: Instant,
 }
 
 /// Either a reference to live connection state, or a synthesized list of paths
@@ -1619,10 +1949,14 @@ impl<'a> PathSelectionContext<'a> {
     fn new(
         current: Option<&'a transports::FourTuple>,
         connections: &'a FxHashMap<ConnId, ConnectionState>,
+        quarantine: &'a BTreeMap<transports::Addr, QuarantineEntry>,
+        now: Instant,
     ) -> Self {
         Self {
             current,
             source: PathsSource::Live(connections),
+            quarantine: Some(quarantine),
+            now,
         }
     }
 
@@ -1635,6 +1969,8 @@ impl<'a> PathSelectionContext<'a> {
         Self {
             current,
             source: PathsSource::Test(paths),
+            quarantine: None,
+            now: Instant::now(),
         }
     }
 
@@ -1648,7 +1984,7 @@ impl<'a> PathSelectionContext<'a> {
     /// The same address may appear more than once when it is a path on multiple
     /// connections to the remote.  Selectors that care should aggregate as appropriate.
     pub fn paths(&self) -> Box<dyn Iterator<Item = PathSelectionData<'a>> + '_> {
-        match &self.source {
+        let paths: Box<dyn Iterator<Item = PathSelectionData<'a>> + '_> = match &self.source {
             PathsSource::Live(connections) => Box::new(
                 connections
                     .values()
@@ -1662,7 +1998,14 @@ impl<'a> PathSelectionContext<'a> {
             ),
             #[cfg(test)]
             PathsSource::Test(paths) => Box::new(paths.iter().cloned()),
-        }
+        };
+        Box::new(paths.filter(|candidate| {
+            !self.quarantine.is_some_and(|quarantine| {
+                quarantine
+                    .get(&candidate.network_path().remote())
+                    .is_some_and(|entry| entry.until > self.now)
+            })
+        }))
     }
 }
 
