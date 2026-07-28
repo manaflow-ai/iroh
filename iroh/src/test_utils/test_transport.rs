@@ -100,6 +100,16 @@ impl TestNetwork {
         }
     }
 
+    /// Starts or stops dropping every packet carried by this test transport.
+    ///
+    /// While enabled, sends still report success but nothing is delivered —
+    /// exactly like a network path that went dark. Other transports on the
+    /// same endpoints (relay, IP) are unaffected, so this simulates the field
+    /// condition "the direct path is dead while the relay stays healthy".
+    pub fn set_blackhole(&self, blackhole: bool) {
+        self.inner.lock().expect("poisoned").blackhole = blackhole;
+    }
+
     /// Creates a new test transport for the given endpoint ID.
     ///
     /// Returns an error if the ID already exists in the network.
@@ -127,6 +137,8 @@ struct TestAddrLookup {
 #[derive(Debug, Default)]
 struct TestNetworkInner {
     channels: BTreeMap<EndpointId, (mpsc::Sender<Packet>, mpsc::Receiver<Packet>)>,
+    /// When `true`, all packets are silently dropped (see [`TestNetwork::set_blackhole`]).
+    blackhole: bool,
 }
 
 impl AddressLookup for TestAddrLookup {
@@ -187,6 +199,15 @@ impl TestSender {
     fn send_sync(&self, dst: &CustomAddr, packets: Vec<Packet>) -> io::Result<()> {
         let to_id = try_parse_custom_addr(dst)?;
         let guard = self.network.inner.lock().expect("poisoned");
+        if guard.blackhole {
+            info!(
+                "send {} -> {}: dropped {} packets (blackhole)",
+                self.id.fmt_short(),
+                to_id.fmt_short(),
+                packets.len()
+            );
+            return Ok(());
+        }
         let (s, _) = guard
             .channels
             .get(&to_id)
@@ -320,7 +341,10 @@ impl CustomEndpoint for TestTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
     use iroh_relay::RelayMap;
     use n0_error::{Result, StdResultExt};
@@ -737,6 +761,188 @@ mod tests {
         );
 
         verify_echo(&conn, b"custom wins over relay").await?;
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
+
+    /// Regression test for the cmux dead-direct-path kill loop: when the
+    /// *selected* direct path goes dark while a healthy relay path is open on
+    /// the same connection, iroh must promptly demote it without closing QUIC.
+    ///
+    /// Field condition being modeled (see
+    /// out/iroh-fork-program/B1-mechanism-note.md in cmuxterm-hq): both a
+    /// direct (primary-tier) and a relay (backup-tier) path exist; the direct
+    /// path is selected (`PathStatus::Available`, relay `Backup`); the direct
+    /// path then black-holes. Because noq pins ALL SpaceKind::Data frames
+    /// (streams, retransmits, ACKs) to the validated+Available path, and iroh
+    /// without iroh's health detector application data stalls until the
+    /// per-path idle timeout (`PATH_MAX_IDLE_TIMEOUT` = 15s) abandons the dead
+    /// path — even though the relay could carry the data the whole time.
+    /// cmux's session layer kills the connection ~2.2s into that black hole
+    /// (sendQueueOverflow / control watchdog), producing the ~2s metronome
+    /// kill loop in the field.
+    ///
+    /// The contract is survival plus relay failover within a generous 6s CI
+    /// margin (the detector normally reacts in ~1-2s), followed by sustained
+    /// application traffic on the same connection.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_dead_selected_direct_path_demotes_to_relay() -> Result<()> {
+        /// The normal ~1-2s demotion gets ample CI headroom while remaining
+        /// far below the old ~15s path-idle recovery.
+        const RECOVERY_DEADLINE: Duration = Duration::from_secs(6);
+        /// Keep probing well past the pre-fix ~15s path-idle recovery so a
+        /// regression is diagnosed as "slow recovery at ~15s" rather than
+        /// "permanently wedged".
+        const PROBE_BUDGET: Duration = Duration::from_secs(45);
+
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        // IP transports are cleared by default in `endpoint_builder`, so the
+        // custom transport is the only primary-tier ("direct") path and the
+        // relay is the only backup-tier path — the exact field topology.
+        let config = EndpointConfig::default().with_relay(relay_map.clone());
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+
+        // Wait for both endpoints to have their relay connection.
+        ep1.online().await;
+        ep2.online().await;
+
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        // Dial with BOTH the relay and the custom address so both paths open.
+        let ep2_addr = ep2.addr();
+        let all_addrs = EndpointAddr::from_parts(
+            s2.public(),
+            ep2_addr
+                .addrs
+                .iter()
+                .cloned()
+                .chain(std::iter::once(TransportAddr::Custom(to_custom_addr(
+                    s2.public(),
+                )))),
+        );
+        let conn = ep1.connect(all_addrs, ECHO_ALPN).await?;
+
+        // Wait until the steady state we are testing: the direct (custom)
+        // path is selected AND a relay path is open on the connection.
+        let settle_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let paths = conn.paths();
+            let has_relay = paths.iter().any(|p| p.is_relay());
+            if has_relay && is_custom_selected(&conn) {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "test setup failed: custom-selected + relay path never settled; paths: {:?}",
+                paths
+                    .iter()
+                    .map(|p| format!("{} selected={}", p.remote_addr(), p.is_selected()))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // One long-lived echo stream; every probe is one byte round-tripped.
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+
+        // Prove the stream echoes while the direct path is healthy.
+        send.write_all(&[0xA5]).await.anyerr()?;
+        let mut byte = [0u8; 1];
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut byte))
+            .await
+            .std_context("echo did not work before the direct path went dark")?
+            .anyerr()?;
+        assert_eq!(byte, [0xA5]);
+
+        // The selected direct path goes completely dark. The relay stays up.
+        network.set_blackhole(true);
+        let dark_at = Instant::now();
+
+        // Probe: write a byte roughly every 500ms and wait for any echo.
+        // Under the bug nothing comes back until noq abandons the dead path
+        // (~15s). Track when data first flows again, or whether the
+        // connection dies first.
+        let mut first_echo_after_dark: Option<Duration> = None;
+        let mut connection_error: Option<String> = None;
+        while dark_at.elapsed() < PROBE_BUDGET {
+            if let Err(err) = send.write_all(&[0x5A]).await {
+                connection_error = Some(format!("write failed: {err:#}"));
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(500), recv.read_exact(&mut byte)).await
+            {
+                Ok(Ok(())) => {
+                    first_echo_after_dark = Some(dark_at.elapsed());
+                    break;
+                }
+                Ok(Err(err)) => {
+                    connection_error = Some(format!("read failed: {err:#}"));
+                    break;
+                }
+                Err(_) => continue, // still stalled, keep probing
+            }
+        }
+
+        eprintln!(
+            "dead-direct probe: first_echo_after_dark={first_echo_after_dark:?} \
+             connection_error={connection_error:?} close_reason={:?} paths={:?}",
+            conn.close_reason(),
+            conn.paths()
+                .iter()
+                .map(|p| format!("{} selected={}", p.remote_addr(), p.is_selected()))
+                .collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            connection_error, None,
+            "the connection errored while the selected direct path was dark"
+        );
+        assert_eq!(
+            conn.close_reason(),
+            None,
+            "demoting the selected path must not close the QUIC connection"
+        );
+        let stall = first_echo_after_dark
+            .expect("application traffic never recovered over the open relay path");
+        assert!(
+            stall < RECOVERY_DEADLINE,
+            "relay recovery took {stall:?}, expected less than {RECOVERY_DEADLINE:?} \
+             (the old path-idle behavior took ~15s)"
+        );
+        assert!(
+            is_relay_selected(&conn),
+            "the relay path should be selected after the dead direct path is demoted"
+        );
+
+        // The echo handler serves this one long-lived stream. Earlier one-byte
+        // probes may already be queued, so read through them until the two new
+        // sentinel bytes prove sustained traffic after recovery.
+        send.write_all(&[0xB6, 0xC7]).await.anyerr()?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                recv.read_exact(&mut byte).await?;
+                if byte == [0xB6] {
+                    recv.read_exact(&mut byte).await?;
+                    assert_eq!(byte, [0xC7]);
+                    return std::result::Result::<(), noq::ReadExactError>::Ok(());
+                }
+                assert_eq!(byte, [0x5A]);
+            }
+        })
+        .await
+        .std_context("sustained echo did not work after relay recovery")?
+        .anyerr()?;
+
         conn.close(0u32.into(), b"done");
         router.shutdown().await.anyerr()?;
         Ok(())
