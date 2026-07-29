@@ -121,11 +121,19 @@ const SELECTED_PATH_HEALTH_INTERVAL: Duration = Duration::from_millis(250);
 /// genuinely stalled path before that failure scale while still allowing normal jitter.
 const SELECTED_PATH_STALL_FLOOR: Duration = Duration::from_secs(1);
 
-/// Minimum transmissions without a receive before treating a selected path as stalled.
+/// Minimum application-bearing frame transmissions without a receive before treating a
+/// selected path as stalled.
 ///
 /// cmux sessions died about 2.2s into the field black hole; requiring several attempted
-/// datagrams lets us detect active stalls before then without ever penalizing an idle path.
-const SELECTED_PATH_STALL_MIN_DATAGRAMS: u64 = 3;
+/// application-bearing frames lets us detect active stalls before then without ever
+/// penalizing an idle path. Only frames that exist because the application has data or
+/// stream state pending delivery count (see [`SelectedPathHealth::app_frames_tx`]):
+/// keepalive PINGs and their PTO probe retransmissions are the whole traffic profile of
+/// an *idle* path during a transient radio gap (WiFi roam, channel switch), and counting
+/// them as evidence demoted and quarantined healthy idle paths that the 15s
+/// [`PATH_MAX_IDLE_TIMEOUT`](crate::socket::PATH_MAX_IDLE_TIMEOUT) was deliberately
+/// sized to tolerate.
+const SELECTED_PATH_STALL_MIN_APP_FRAMES: u64 = 3;
 
 /// Initial quarantine after a selected path is demoted.
 ///
@@ -1042,6 +1050,7 @@ impl RemoteStateActor {
                 conn_state.selected_health = None;
                 continue;
             };
+            let app_tx = SelectedPathHealth::app_frames_tx(&stats);
 
             let tracker_matches = conn_state
                 .selected_health
@@ -1053,7 +1062,7 @@ impl RemoteStateActor {
                 conn_state.selected_health = Some(SelectedPathHealth {
                     network_path: selected.clone(),
                     path_id,
-                    last_udp_tx: stats.udp_tx.datagrams,
+                    last_app_tx: app_tx,
                     last_udp_rx: stats.udp_rx.datagrams,
                     stalled_since: None,
                     stalled_tx: 0,
@@ -1070,13 +1079,21 @@ impl RemoteStateActor {
                 // if loss or a busy receiver made the preceding ticks look one-way.
                 health.stalled_since = None;
                 health.stalled_tx = 0;
-            } else if stats.udp_tx.datagrams > health.last_udp_tx {
-                // Transmission progress is required to begin or extend a stall. An idle
-                // selected path therefore never accumulates evidence or gets demoted.
-                health.stalled_tx += stats.udp_tx.datagrams - health.last_udp_tx;
+            } else if app_tx > health.last_app_tx {
+                // Application-bearing transmission progress is required to begin or
+                // extend a stall, so an idle selected path never accumulates evidence
+                // or gets demoted. Raw datagram counters would not give that guarantee:
+                // keepalive PINGs and their PTO probe retransmissions keep them moving
+                // on a fully idle path during a transient radio gap, which is exactly
+                // the outage profile the 15s path-idle timeout is sized to ride out.
+                // Genuinely stalled *application* traffic still accumulates evidence at
+                // full speed, because PTO probes retransmit pending or in-flight
+                // STREAM/DATAGRAM frames whenever any exist and only fall back to bare
+                // PINGs when there is nothing application-bearing to carry.
+                health.stalled_tx += app_tx - health.last_app_tx;
                 health.stalled_since.get_or_insert(now);
             }
-            health.last_udp_tx = stats.udp_tx.datagrams;
+            health.last_app_tx = app_tx;
             health.last_udp_rx = stats.udp_rx.datagrams;
 
             let stall_threshold =
@@ -1084,7 +1101,7 @@ impl RemoteStateActor {
             if health
                 .stalled_since
                 .is_some_and(|since| now.duration_since(since) >= stall_threshold)
-                && health.stalled_tx >= SELECTED_PATH_STALL_MIN_DATAGRAMS
+                && health.stalled_tx >= SELECTED_PATH_STALL_MIN_APP_FRAMES
             {
                 // Never demote the selected path unless this same connection retains
                 // another eligible open path. This prevents health detection from
@@ -1857,14 +1874,31 @@ struct ConnectionState {
 struct SelectedPathHealth {
     network_path: transports::FourTuple,
     path_id: PathId,
-    /// Cumulative `udp_tx.datagrams` at the previous detector tick.
-    last_udp_tx: u64,
+    /// Cumulative [`Self::app_frames_tx`] at the previous detector tick.
+    last_app_tx: u64,
     /// Cumulative `udp_rx.datagrams` at the previous detector tick.
     last_udp_rx: u64,
-    /// First tick where transmission progressed without any receive progress.
+    /// First tick where application-bearing transmission progressed without any
+    /// receive progress.
     stalled_since: Option<Instant>,
-    /// Datagrams transmitted since `stalled_since`.
+    /// Application-bearing frames transmitted since `stalled_since`.
     stalled_tx: u64,
+}
+
+impl SelectedPathHealth {
+    /// Cumulative application-bearing frames transmitted on the path.
+    ///
+    /// Counts only frames that exist because the application has data or stream state
+    /// pending delivery: STREAM and DATAGRAM carry payload, RESET_STREAM and
+    /// STOP_SENDING are application-initiated stream state that is retransmitted until
+    /// acknowledged. Keepalive PINGs, PTO probe PINGs, IMMEDIATE_ACKs, ACKs and path
+    /// maintenance frames are deliberately excluded: they are the only traffic an idle
+    /// path transmits during a transient radio gap, and they must never count as stall
+    /// evidence.
+    fn app_frames_tx(stats: &PathStats) -> u64 {
+        let frames = &stats.frame_tx;
+        frames.stream + frames.datagram + frames.reset_stream + frames.stop_sending
+    }
 }
 
 impl ConnectionState {
