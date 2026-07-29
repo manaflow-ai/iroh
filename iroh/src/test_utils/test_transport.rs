@@ -947,4 +947,155 @@ mod tests {
         router.shutdown().await.anyerr()?;
         Ok(())
     }
+
+    /// Regression test: keepalive PINGs and their PTO probe retransmissions
+    /// must never count as stall evidence for the selected-path health
+    /// detector.
+    ///
+    /// Field condition being modeled: an established connection sits idle (no
+    /// application data pending) on a selected direct path when the radio
+    /// drops for a few seconds — a WiFi roam or channel switch, well below
+    /// `PATH_MAX_IDLE_TIMEOUT` (15s), which the idle timeout was deliberately
+    /// sized to tolerate. The only traffic in that gap is the 5s keepalive
+    /// PING (`HEARTBEAT_INTERVAL`) plus its PTO probe retransmissions. If the
+    /// detector counts those raw datagrams as stall evidence, one lost
+    /// keepalive and two probes reach the demotion threshold within the 1s
+    /// stall floor, and the healthy direct path is demoted AND quarantined
+    /// (5s doubling to 300s) with zero application data affected. Repeated
+    /// transients then ratchet the quarantine and pin the user to the relay.
+    #[tokio::test]
+    #[traced_test]
+    async fn test_selected_direct_path_idle_transient_loss_does_not_demote() -> Result<()> {
+        /// Longer than one `HEARTBEAT_INTERVAL` (5s), so at least one
+        /// keepalive PING is lost and PTO-probed inside the gap, while
+        /// staying well below `PATH_MAX_IDLE_TIMEOUT` (15s), which must be
+        /// the only mechanism allowed to abandon an idle path.
+        const DARK_WINDOW: Duration = Duration::from_secs(8);
+
+        let (relay_map, _relay_url, _guard) = run_relay_server().await?;
+        let network = TestNetwork::new();
+        let s1 = SecretKey::generate();
+        let s2 = SecretKey::generate();
+
+        let t1 = network.create_transport(s1.public())?;
+        let t2 = network.create_transport(s2.public())?;
+
+        // Same topology as the dead-path demotion test: the custom transport
+        // is the only primary-tier ("direct") path, the relay the only
+        // backup-tier path. The relay's presence is what makes a wrong
+        // demotion possible at all (`has_alternative`).
+        let config = EndpointConfig::default().with_relay(relay_map.clone());
+        let ep1 = endpoint_builder(s1, t1, config.clone()).bind().await?;
+        let ep2 = endpoint_builder(s2.clone(), t2, config).bind().await?;
+
+        ep1.online().await;
+        ep2.online().await;
+
+        let router = Router::builder(ep2.clone()).accept(ECHO_ALPN, Echo).spawn();
+
+        let ep2_addr = ep2.addr();
+        let all_addrs = EndpointAddr::from_parts(
+            s2.public(),
+            ep2_addr
+                .addrs
+                .iter()
+                .cloned()
+                .chain(std::iter::once(TransportAddr::Custom(to_custom_addr(
+                    s2.public(),
+                )))),
+        );
+        let conn = ep1.connect(all_addrs, ECHO_ALPN).await?;
+
+        // Wait for the steady state: direct (custom) selected, relay open.
+        let settle_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let paths = conn.paths();
+            let has_relay = paths.iter().any(|p| p.is_relay());
+            if has_relay && is_custom_selected(&conn) {
+                break;
+            }
+            assert!(
+                Instant::now() < settle_deadline,
+                "test setup failed: custom-selected + relay path never settled; paths: {:?}",
+                paths
+                    .iter()
+                    .map(|p| format!("{} selected={}", p.remote_addr(), p.is_selected()))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // One long-lived echo stream (the Echo handler serves exactly one).
+        let (mut send, mut recv) = conn.open_bi().await.anyerr()?;
+        let mut byte = [0u8; 1];
+
+        // Prove the stream echoes while the direct path is healthy.
+        send.write_all(&[0xA5]).await.anyerr()?;
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut byte))
+            .await
+            .std_context("echo did not work before the transient loss")?
+            .anyerr()?;
+        assert_eq!(byte, [0xA5]);
+
+        // Let the echo's trailing retransmits/ACKs drain so the connection is
+        // genuinely idle: no application data pending anywhere.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        // Transient radio gap: every packet on the direct transport is lost,
+        // while the connection stays idle. Only keepalives and PTO probes are
+        // transmitted during this window.
+        network.set_blackhole(true);
+        let dark_at = Instant::now();
+        while dark_at.elapsed() < DARK_WINDOW {
+            assert_eq!(
+                conn.close_reason(),
+                None,
+                "the connection must survive an idle transient loss"
+            );
+            assert!(
+                is_custom_selected(&conn),
+                "idle transient loss demoted the selected direct path after {:?} \
+                 (only keepalive/PTO traffic was in flight); paths: {:?}",
+                dark_at.elapsed(),
+                conn.paths()
+                    .iter()
+                    .map(|p| format!("{} selected={}", p.remote_addr(), p.is_selected()))
+                    .collect::<Vec<_>>()
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        network.set_blackhole(false);
+
+        // Give the next keepalive/PTO probe a moment to round-trip now that
+        // the transient cleared.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // The path was never demoted, so it must still be selected (a
+        // demotion would have quarantined the direct remote for >= 5s,
+        // pinning selection to the relay well past this point).
+        assert!(
+            is_custom_selected(&conn),
+            "the direct path must still be selected after the transient cleared; paths: {:?}",
+            conn.paths()
+                .iter()
+                .map(|p| format!("{} selected={}", p.remote_addr(), p.is_selected()))
+                .collect::<Vec<_>>()
+        );
+
+        // And it must still carry application data on the same stream.
+        send.write_all(&[0x42]).await.anyerr()?;
+        tokio::time::timeout(Duration::from_secs(5), recv.read_exact(&mut byte))
+            .await
+            .std_context("echo did not work after the transient loss cleared")?
+            .anyerr()?;
+        assert_eq!(byte, [0x42]);
+        assert!(
+            is_custom_selected(&conn),
+            "application traffic after the transient must still ride the direct path"
+        );
+
+        conn.close(0u32.into(), b"done");
+        router.shutdown().await.anyerr()?;
+        Ok(())
+    }
 }
