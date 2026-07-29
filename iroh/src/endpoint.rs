@@ -4626,7 +4626,7 @@ mod tests {
             expected: expected.clone(),
             observed: observed_tx,
         });
-        let (_relay_map, relay_url, relay_server) =
+        let (_relay_map, relay_url, _relay_server) =
             run_relay_server_with_access(false, access).await?;
         let initial_map: RelayMap = RelayConfig::new(relay_url.clone(), None)
             .with_auth_token(TOKEN_A)
@@ -4692,14 +4692,6 @@ mod tests {
                 Arc::new(RelayConfig::new(relay_url, None).with_auth_token(TOKEN_B)),
             )
             .await;
-
-        assert!(
-            relay_server
-                .relay_service()
-                .expect("relay service")
-                .clients()
-                .disconnect(client.id(), None)
-        );
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while let Some(token) = observed_rx.recv().await {
