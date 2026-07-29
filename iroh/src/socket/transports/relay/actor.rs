@@ -140,14 +140,13 @@ struct ActiveRelayActor {
     url: RelayUrl,
     /// Builder which can repeatedly build a relay client.
     relay_client_builder: relay::client::ClientBuilder,
-    /// Shared relay configuration. Connection-scoped credentials are read
-    /// immediately before every dial so a reconnect uses the latest token.
-    relay_map: RelayMap,
-    /// Whether or not this is the home relay server.
-    ///
-    /// The home relay server needs to maintain it's connection to the relay server, even if
-    /// the relay actor is otherwise idle.
-    is_home_relay: bool,
+    /// The role this connection currently serves.
+    role: ActiveRelayRole,
+    /// Reports authenticated connections to the parent actor so it can
+    /// atomically replace an older connection.
+    events: mpsc::UnboundedSender<ActiveRelayEvent>,
+    /// Identifies this actor instance when multiple generations use the same URL.
+    generation: u64,
     /// When this expires the actor has been idle and should shut down.
     ///
     /// Unless it is managing the home relay connection.  Inactivity is only tracked on the
@@ -171,8 +170,8 @@ enum ActiveRelayMessage {
     /// connection uses a local socket with an IP address not in this list the server will
     /// always re-connect.
     CheckConnection { local_ips: Vec<IpAddr> },
-    /// Sets this relay as the home relay, or not.
-    SetHomeRelay(bool),
+    /// Sets the role this relay connection serves.
+    SetRole(ActiveRelayRole),
     #[cfg(test)]
     GetLocalAddr(oneshot::Sender<Option<SocketAddr>>),
     #[cfg(test)]
@@ -199,7 +198,9 @@ struct ActiveRelayActorOptions {
     relay_datagrams_send: mpsc::Receiver<RelaySendItem>,
     relay_datagrams_recv: mpsc::Sender<RelayRecvDatagram>,
     connection_opts: RelayConnectionOptions,
-    relay_map: RelayMap,
+    role: ActiveRelayRole,
+    events: mpsc::UnboundedSender<ActiveRelayEvent>,
+    generation: u64,
     stop_token: CancellationToken,
     metrics: Arc<SocketMetrics>,
     my_relay: HomeRelayWatch,
@@ -214,6 +215,32 @@ struct RelayConnectionOptions {
     proxy_url: Option<Url>,
     prefer_ipv6: Arc<AtomicBool>,
     tls_config: rustls::ClientConfig,
+    auth_token: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveRelayRole {
+    /// An on-demand connection which may exit after inactivity.
+    Ordinary,
+    /// The published home relay connection, kept alive indefinitely.
+    Home,
+    /// A replacement being authenticated before it becomes active.
+    Replacement,
+}
+
+impl ActiveRelayRole {
+    fn keeps_alive(self) -> bool {
+        matches!(self, Self::Home | Self::Replacement)
+    }
+
+    fn publishes_home_status(self) -> bool {
+        matches!(self, Self::Home)
+    }
+}
+
+#[derive(Debug)]
+enum ActiveRelayEvent {
+    Connected { url: RelayUrl, generation: u64 },
 }
 
 /// Possible reasons for a failed relay connection.
@@ -271,7 +298,9 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             relay_datagrams_recv,
             connection_opts,
-            relay_map,
+            role,
+            events,
+            generation,
             stop_token,
             metrics,
             my_relay,
@@ -284,8 +313,9 @@ impl ActiveRelayActor {
             relay_datagrams_send,
             url,
             relay_client_builder,
-            relay_map,
-            is_home_relay: false,
+            role,
+            events,
+            generation,
             inactive_timeout: Box::pin(time::sleep(RELAY_INACTIVE_CLEANUP_TIME)),
             stop_token,
             metrics,
@@ -304,6 +334,7 @@ impl ActiveRelayActor {
             proxy_url,
             prefer_ipv6,
             tls_config,
+            auth_token,
         } = opts;
 
         let mut builder = relay::client::ClientBuilder::new(
@@ -316,6 +347,9 @@ impl ActiveRelayActor {
         .address_family_selector(move || prefer_ipv6.load(Ordering::Relaxed));
         if let Some(proxy_url) = proxy_url {
             builder = builder.proxy_url(proxy_url);
+        }
+        if let Some(auth_token) = auth_token {
+            builder = builder.auth_token(auth_token);
         }
 
         builder
@@ -331,10 +365,12 @@ impl ActiveRelayActor {
             warn!("{err:#}");
             let was_established = matches!(err, RelayConnectionError::Established { .. });
             let last_failure = Some(Arc::new(RelayConnectionFailure::new(err)));
-            self.my_relay.set_status(
-                &self.url,
-                RelayConnectionState::Disconnected { last_failure },
-            );
+            if self.role.publishes_home_status() {
+                self.my_relay.set_status(
+                    &self.url,
+                    RelayConnectionState::Disconnected { last_failure },
+                );
+            }
             if !was_established {
                 // If dialing failed, or if the relay connection failed before we received a pong,
                 // we wait an exponentially increasing time until we attempt to reconnect again.
@@ -406,8 +442,10 @@ impl ActiveRelayActor {
     /// be retried with a backoff.
     #[allow(clippy::result_large_err)]
     async fn run_once(&mut self) -> Result<(), RelayConnectionError> {
-        self.my_relay
-            .set_status(&self.url, RelayConnectionState::Connecting);
+        if self.role.publishes_home_status() {
+            self.my_relay
+                .set_status(&self.url, RelayConnectionState::Connecting);
+        }
         let client = match self.run_dialing().instrument(info_span!("dialing")).await {
             Some(Ok(client)) => client,
             Some(Err(err)) => {
@@ -416,9 +454,15 @@ impl ActiveRelayActor {
             }
             None => return Ok(()),
         };
-        self.my_relay
-            .set_status(&self.url, RelayConnectionState::Connected);
+        if self.role.publishes_home_status() {
+            self.my_relay
+                .set_status(&self.url, RelayConnectionState::Connected);
+        }
         self.metrics.relay_conns_success.inc();
+        let _ = self.events.send(ActiveRelayEvent::Connected {
+            url: self.url.clone(),
+            generation: self.generation,
+        });
         let res = self
             .run_connected(client)
             .instrument(info_span!("connected"))
@@ -433,14 +477,17 @@ impl ActiveRelayActor {
             .reset(Instant::now() + RELAY_INACTIVE_CLEANUP_TIME);
     }
 
-    fn set_home_relay(&mut self, is_home: bool) {
-        let prev = std::mem::replace(&mut self.is_home_relay, is_home);
-        if self.is_home_relay != prev {
+    fn set_role(&mut self, role: ActiveRelayRole) {
+        let prev = std::mem::replace(&mut self.role, role);
+        if self.role != prev {
+            if prev == ActiveRelayRole::Replacement && role == ActiveRelayRole::Ordinary {
+                self.reset_inactive_timeout();
+            }
             event!(
                 target: "iroh::_events::relay::home_changed",
                 Level::DEBUG,
                 url = %self.url,
-                home_relay = self.is_home_relay,
+                home_relay = self.role == ActiveRelayRole::Home,
             );
         }
     }
@@ -498,8 +545,8 @@ impl ActiveRelayActor {
                         break None;
                     };
                     match msg {
-                        ActiveRelayMessage::SetHomeRelay(is_home) => {
-                            self.set_home_relay(is_home);
+                        ActiveRelayMessage::SetRole(role) => {
+                            self.set_role(role);
                         }
                         ActiveRelayMessage::CheckConnection { .. } => {}
                         #[cfg(test)]
@@ -522,7 +569,7 @@ impl ActiveRelayActor {
                         }
                     }
                 }
-                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                _ = &mut self.inactive_timeout, if !self.role.keeps_alive() => {
                     debug!(?RELAY_INACTIVE_CLEANUP_TIME, "Inactive, exiting.");
                     break None;
                 }
@@ -537,14 +584,7 @@ impl ActiveRelayActor {
     /// forever.
     // This is using `impl Future` to return a future without a reference to self.
     fn dial_relay(&self) -> impl Future<Output = Result<Client, DialError>> + use<> {
-        let mut client_builder = self.relay_client_builder.clone();
-        if let Some(token) = self
-            .relay_map
-            .get(&self.url)
-            .and_then(|config| config.auth_token.clone())
-        {
-            client_builder = client_builder.auth_token(token);
-        }
+        let client_builder = self.relay_client_builder.clone();
         async move {
             match time::timeout(CONNECT_TIMEOUT, client_builder.connect()).await {
                 Ok(Ok(client)) => Ok(client),
@@ -570,7 +610,7 @@ impl ActiveRelayActor {
             target: "iroh::_events::relay::connected",
             Level::DEBUG,
             url = %self.url,
-            home_relay = self.is_home_relay,
+            home_relay = self.role == ActiveRelayRole::Home,
         );
 
         let (mut client_stream, client_sink) = client.split();
@@ -633,13 +673,13 @@ impl ActiveRelayActor {
                         break Ok(());
                     };
                     match msg {
-                        ActiveRelayMessage::SetHomeRelay(is_home) => {
-                            self.set_home_relay(is_home);
+                        ActiveRelayMessage::SetRole(role) => {
+                            self.set_role(role);
                             // We are in `run_connected`, so if we just became the home
                             // relay, publish `Connected` (the `RelayActor` only sets
                             // `Connecting` on the URL change since it cannot know our
                             // actual state).
-                            if is_home {
+                            if role == ActiveRelayRole::Home {
                                 self.my_relay
                                     .set_status(&self.url, RelayConnectionState::Connected);
                             }
@@ -704,7 +744,7 @@ impl ActiveRelayActor {
                         Err(err) => break Err(e!(RunError::ClientStreamRead, err)),
                     }
                 }
-                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                _ = &mut self.inactive_timeout, if !self.role.keeps_alive() => {
                     debug!("Inactive for {RELAY_INACTIVE_CLEANUP_TIME:?}, exiting (running).");
                     break Ok(());
                 }
@@ -854,7 +894,7 @@ impl ActiveRelayActor {
                         Err(err) => break Err(e!(RunError::ClientStreamRead, err)),
                     }
                 }
-                _ = &mut self.inactive_timeout, if !self.is_home_relay => {
+                _ = &mut self.inactive_timeout, if !self.role.keeps_alive() => {
                     debug!("Inactive for {RELAY_INACTIVE_CLEANUP_TIME:?}, exiting (sending).");
                     break Ok(());
                 }
@@ -941,8 +981,13 @@ pub(super) struct RelayActor {
     /// These actors will exit when they have any inactivity.  Otherwise they will keep
     /// trying to maintain a connection to the relay server as needed.
     active_relays: BTreeMap<RelayUrl, ActiveRelayHandle>,
+    /// Authenticated replacements which have not yet taken ownership.
+    pending_rotations: BTreeMap<RelayUrl, PendingRelayRotation>,
     /// The tasks for the [`ActiveRelayActor`]s in `active_relays` above.
     active_relay_tasks: JoinSet<()>,
+    active_relay_events_tx: mpsc::UnboundedSender<ActiveRelayEvent>,
+    active_relay_events_rx: mpsc::UnboundedReceiver<ActiveRelayEvent>,
+    next_generation: u64,
     cancel_token: CancellationToken,
 }
 
@@ -1081,7 +1126,8 @@ fn auth_denied_reason(error: &RelayConnectionError) -> Option<&str> {
 /// The [`RelayActor`] writes the URL (via [`Self::set`] and [`Self::clear`]).
 /// Each [`ActiveRelayActor`] updates only the status (via [`Self::set_status`]),
 /// which guards against stale writes: if another relay has become home since this actor
-/// was designated, the write is silently dropped.
+/// was designated, the write is silently dropped. Replacement actors never publish status
+/// until the parent atomically promotes them.
 #[derive(Debug, Clone)]
 pub(crate) struct HomeRelayWatch {
     inner: Watchable<Option<RelayStatus>>,
@@ -1110,7 +1156,7 @@ impl HomeRelayWatch {
     ///
     /// This is the only write method [`ActiveRelayActor`] should use. It prevents a
     /// demoted actor from overwriting a newer home relay's status: the [`RelayActor`]
-    /// updates the URL in the watchable *before* sending `SetHomeRelay(false)`, so by
+    /// updates the URL in the watchable *before* demoting the old actor, so by
     /// the time the old actor tries to write, the URL no longer matches.
     fn set_status(&self, url: &RelayUrl, state: RelayConnectionState) {
         if self.inner.get().as_ref().map(RelayStatus::url) == Some(url) {
@@ -1133,11 +1179,16 @@ impl RelayActor {
         relay_datagram_recv_queue: mpsc::Sender<RelayRecvDatagram>,
         cancel_token: CancellationToken,
     ) -> Self {
+        let (active_relay_events_tx, active_relay_events_rx) = mpsc::unbounded_channel();
         Self {
             config,
             relay_datagram_recv_queue,
             active_relays: Default::default(),
+            pending_rotations: Default::default(),
             active_relay_tasks: JoinSet::new(),
+            active_relay_events_tx,
+            active_relay_events_rx,
+            next_generation: 0,
             cancel_token,
         }
     }
@@ -1161,6 +1212,11 @@ impl RelayActor {
                 Some(res) = self.active_relay_tasks.join_next() => {
                     log_active_relay_task_result(res);
                     self.reap_active_relays();
+                }
+                event = self.active_relay_events_rx.recv() => {
+                    if let Some(event) = event {
+                        self.handle_active_relay_event(event);
+                    }
                 }
                 msg = receiver.recv() => {
                     let Some(msg) = msg else {
@@ -1225,11 +1281,12 @@ impl RelayActor {
             .as_ref()
             .is_some_and(|status| status.url() == &url);
         if present {
-            // Connection-scoped credentials authenticate a relay dial. Keep
-            // an established route alive when its configuration changes; the
-            // active actor reads the latest configuration on its next dial.
-            // This prevents a receiving endpoint from disappearing from the
-            // relay between token refresh and replacement authentication.
+            // Relay credentials are connection-scoped. Authenticate a new
+            // client before replacing the established route so a token refresh
+            // cannot interrupt datagrams or make this endpoint disappear.
+            if let Some(pending) = self.pending_rotations.remove(&url) {
+                pending.replacement.stop_token.cancel();
+            }
             if self
                 .active_relays
                 .get(&url)
@@ -1237,13 +1294,27 @@ impl RelayActor {
             {
                 self.active_relays.remove(&url);
             }
-            if was_home && !self.active_relays.contains_key(&url) {
+            if let Some(previous) = self.active_relays.get(&url).cloned() {
+                let replacement =
+                    self.start_active_relay(url.clone(), ActiveRelayRole::Replacement);
+                self.pending_rotations.insert(
+                    url,
+                    PendingRelayRotation {
+                        generation: replacement.generation,
+                        previous,
+                        replacement,
+                    },
+                );
+            } else if was_home {
                 self.active_relay_handle(url);
             }
             self.log_active_relay();
             return;
         }
 
+        if let Some(pending) = self.pending_rotations.remove(&url) {
+            pending.replacement.stop_token.cancel();
+        }
         if let Some(handle) = self.active_relays.remove(&url) {
             handle.stop_token.cancel();
         }
@@ -1257,6 +1328,47 @@ impl RelayActor {
             return;
         }
         self.log_active_relay();
+    }
+
+    fn handle_active_relay_event(&mut self, event: ActiveRelayEvent) {
+        match event {
+            ActiveRelayEvent::Connected { url, generation } => {
+                let Some(pending) = self.pending_rotations.get(&url) else {
+                    return;
+                };
+                if pending.generation != generation {
+                    return;
+                }
+                let pending = self
+                    .pending_rotations
+                    .remove(&url)
+                    .expect("pending rotation was just checked");
+                let role = if self
+                    .config
+                    .my_relay
+                    .get()
+                    .as_ref()
+                    .is_some_and(|status| status.url() == &url)
+                {
+                    ActiveRelayRole::Home
+                } else {
+                    ActiveRelayRole::Ordinary
+                };
+                if let Err(err) = pending
+                    .replacement
+                    .inbox_addr
+                    .try_send(ActiveRelayMessage::SetRole(role))
+                {
+                    warn!(?url, "Failed to promote replacement relay actor: {err:#}");
+                    pending.replacement.stop_token.cancel();
+                    return;
+                }
+                self.active_relays.insert(url.clone(), pending.replacement);
+                pending.previous.stop_token.cancel();
+                debug!(?url, "Replaced relay connection after credential handoff");
+                self.log_active_relay();
+            }
+        }
     }
 
     /// Sends datagrams to the correct [`ActiveRelayActor`], or returns a future.
@@ -1306,7 +1418,7 @@ impl RelayActor {
             info!("home is now relay {}, was {:?}", relay_url, prev_url);
             // Publish `Connecting` initially. If an `ActiveRelayActor` already
             // exists for this URL it will republish its actual status (e.g.
-            // `Connected`) when it receives the `SetHomeRelay(true)` message
+            // `Connected`) when it receives the home role
             // sent below.
             self.config
                 .my_relay
@@ -1323,7 +1435,11 @@ impl RelayActor {
             let is_preferred = url == home_url_ref;
             handle
                 .inbox_addr
-                .send(ActiveRelayMessage::SetHomeRelay(is_preferred))
+                .send(ActiveRelayMessage::SetRole(if is_preferred {
+                    ActiveRelayRole::Home
+                } else {
+                    ActiveRelayRole::Ordinary
+                }))
                 .await
                 .ok()
         }))
@@ -1384,14 +1500,13 @@ impl RelayActor {
         match self.active_relays.get(&url) {
             Some(e) => e.clone(),
             None => {
-                let handle = self.start_active_relay(url.clone());
-                if Some(&url) == self.config.my_relay.get().as_ref().map(RelayStatus::url)
-                    && let Err(err) = handle
-                        .inbox_addr
-                        .try_send(ActiveRelayMessage::SetHomeRelay(true))
-                {
-                    error!("Home relay not set, send to new actor failed: {err:#}.");
-                }
+                let role =
+                    if Some(&url) == self.config.my_relay.get().as_ref().map(RelayStatus::url) {
+                        ActiveRelayRole::Home
+                    } else {
+                        ActiveRelayRole::Ordinary
+                    };
+                let handle = self.start_active_relay(url.clone(), role);
                 self.active_relays.insert(url, handle.clone());
                 self.log_active_relay();
                 handle
@@ -1399,9 +1514,14 @@ impl RelayActor {
         }
     }
 
-    fn start_active_relay(&mut self, url: RelayUrl) -> ActiveRelayHandle {
+    fn start_active_relay(&mut self, url: RelayUrl, role: ActiveRelayRole) -> ActiveRelayHandle {
         debug!(?url, "Adding relay connection");
 
+        let auth_token = self
+            .config
+            .relay_map
+            .get(&url)
+            .and_then(|config| config.auth_token.clone());
         let connection_opts = RelayConnectionOptions {
             secret_key: self.config.secret_key.clone(),
             #[cfg(not(wasm_browser))]
@@ -1409,6 +1529,7 @@ impl RelayActor {
             proxy_url: self.config.proxy_url.clone(),
             prefer_ipv6: self.config.ipv6_reported.clone(),
             tls_config: self.config.tls_config.clone(),
+            auth_token,
         };
 
         // TODO: Replace 64 with PER_CLIENT_SEND_QUEUE_DEPTH once that's unused
@@ -1417,6 +1538,8 @@ impl RelayActor {
         let (inbox_tx, inbox_rx) = mpsc::channel(64);
         let span = info_span!("active-relay", %url);
         let stop_token = self.cancel_token.child_token();
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
         let opts = ActiveRelayActorOptions {
             url: url.clone(),
             prio_inbox_: prio_inbox_rx,
@@ -1424,7 +1547,9 @@ impl RelayActor {
             relay_datagrams_send: send_datagram_rx,
             relay_datagrams_recv: self.relay_datagram_recv_queue.clone(),
             connection_opts,
-            relay_map: self.config.relay_map.clone(),
+            role,
+            events: self.active_relay_events_tx.clone(),
+            generation,
             stop_token: stop_token.clone(),
             metrics: self.config.metrics.clone(),
             my_relay: self.config.my_relay.clone(),
@@ -1441,6 +1566,7 @@ impl RelayActor {
             inbox_addr: inbox_tx,
             datagrams_send_queue: send_datagram_tx,
             stop_token,
+            generation,
         };
         self.log_active_relay();
         handle
@@ -1494,6 +1620,8 @@ impl RelayActor {
     fn reap_active_relays(&mut self) {
         self.active_relays
             .retain(|_url, handle| !handle.inbox_addr.is_closed());
+        self.pending_rotations
+            .retain(|_url, pending| !pending.replacement.inbox_addr.is_closed());
 
         // Make sure the configured home relay exists. A removed home remains
         // published until net-report selects its replacement, but must not be
@@ -1556,6 +1684,13 @@ struct ActiveRelayHandle {
     inbox_addr: mpsc::Sender<ActiveRelayMessage>,
     datagrams_send_queue: mpsc::Sender<RelaySendItem>,
     stop_token: CancellationToken,
+    generation: u64,
+}
+
+struct PendingRelayRotation {
+    generation: u64,
+    previous: ActiveRelayHandle,
+    replacement: ActiveRelayHandle,
 }
 
 /// A single datagram received from a relay server.
@@ -1577,7 +1712,7 @@ mod tests {
 
     use iroh_base::{EndpointId, RelayUrl, SecretKey};
     use iroh_relay::{
-        PingTracker, RelayMap,
+        PingTracker,
         protos::relay::Datagrams,
         tls::{CaTlsConfig, default_provider},
     };
@@ -1588,9 +1723,10 @@ mod tests {
     use tracing::{Instrument, info, info_span};
 
     use super::{
-        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayMessage, ActiveRelayPrioMessage,
-        Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor, RelayConnectionOptions, RelayMap,
-        RelayRecvDatagram, RelaySendItem, UNDELIVERABLE_DATAGRAM_TIMEOUT,
+        ActiveRelayActor, ActiveRelayActorOptions, ActiveRelayEvent, ActiveRelayMessage,
+        ActiveRelayPrioMessage, ActiveRelayRole, Config, RELAY_INACTIVE_CLEANUP_TIME, RelayActor,
+        RelayConnectionOptions, RelayMap, RelayRecvDatagram, RelaySendItem,
+        UNDELIVERABLE_DATAGRAM_TIMEOUT,
     };
     use crate::{dns::DnsResolver, metrics::SocketMetrics, test_utils};
 
@@ -1638,6 +1774,7 @@ mod tests {
         metrics: Arc<SocketMetrics>,
         span: tracing::Span,
     ) -> AbortOnDropHandle<()> {
+        let (events, _event_rx) = mpsc::unbounded_channel::<ActiveRelayEvent>();
         let opts = ActiveRelayActorOptions {
             url: url.clone(),
             prio_inbox_: prio_inbox_rx,
@@ -1652,8 +1789,11 @@ mod tests {
                 tls_config: CaTlsConfig::insecure_skip_verify()
                     .client_config(default_provider())
                     .expect("infallible"),
+                auth_token: None,
             },
-            relay_map: RelayMap::from_iter([url.clone()]),
+            role: ActiveRelayRole::Ordinary,
+            events,
+            generation: 0,
             stop_token,
             metrics,
             my_relay: Default::default(),
@@ -2003,6 +2143,7 @@ mod tests {
         let (_inbox_tx, inbox_rx) = mpsc::channel(16);
         let (_send_datagram_tx, send_datagram_rx) = mpsc::channel(16);
         let (recv_datagram_tx, _recv_datagram_rx) = mpsc::channel(16);
+        let (events, _event_rx) = mpsc::unbounded_channel::<ActiveRelayEvent>();
         let opts = ActiveRelayActorOptions {
             url,
             prio_inbox_: prio_inbox_rx,
@@ -2019,6 +2160,9 @@ mod tests {
                     .expect("infallible"),
                 auth_token: None,
             },
+            role: ActiveRelayRole::Ordinary,
+            events,
+            generation: 0,
             stop_token: CancellationToken::new(),
             metrics: Default::default(),
             my_relay: Default::default(),
