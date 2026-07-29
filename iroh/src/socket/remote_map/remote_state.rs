@@ -1065,7 +1065,7 @@ impl RemoteStateActor {
                     last_app_tx: app_tx,
                     last_udp_rx: stats.udp_rx.datagrams,
                     stalled_since: None,
-                    stalled_tx: 0,
+                    stalled_app_frames: 0,
                 });
                 continue;
             }
@@ -1078,7 +1078,7 @@ impl RemoteStateActor {
                 // Any receive progress proves the path still carries peer traffic, even
                 // if loss or a busy receiver made the preceding ticks look one-way.
                 health.stalled_since = None;
-                health.stalled_tx = 0;
+                health.stalled_app_frames = 0;
             } else if app_tx > health.last_app_tx {
                 // Application-bearing transmission progress is required to begin or
                 // extend a stall, so an idle selected path never accumulates evidence
@@ -1090,7 +1090,7 @@ impl RemoteStateActor {
                 // full speed, because PTO probes retransmit pending or in-flight
                 // STREAM/DATAGRAM frames whenever any exist and only fall back to bare
                 // PINGs when there is nothing application-bearing to carry.
-                health.stalled_tx += app_tx - health.last_app_tx;
+                health.stalled_app_frames += app_tx - health.last_app_tx;
                 health.stalled_since.get_or_insert(now);
             }
             health.last_app_tx = app_tx;
@@ -1101,7 +1101,7 @@ impl RemoteStateActor {
             if health
                 .stalled_since
                 .is_some_and(|since| now.duration_since(since) >= stall_threshold)
-                && health.stalled_tx >= SELECTED_PATH_STALL_MIN_APP_FRAMES
+                && health.stalled_app_frames >= SELECTED_PATH_STALL_MIN_APP_FRAMES
             {
                 // Never demote the selected path unless this same connection retains
                 // another eligible open path. This prevents health detection from
@@ -1882,7 +1882,7 @@ struct SelectedPathHealth {
     /// receive progress.
     stalled_since: Option<Instant>,
     /// Application-bearing frames transmitted since `stalled_since`.
-    stalled_tx: u64,
+    stalled_app_frames: u64,
 }
 
 impl SelectedPathHealth {
