@@ -4858,8 +4858,9 @@ mod tests {
             .anyerr()?;
         assert_eq!(&echoed_during, b"during");
 
-        // Simulate relay-side JWT expiry. The active actor must reconnect
-        // with the latest token from the shared relay map.
+        // Simulate relay-side JWT expiry while replacement authentication is
+        // deliberately held. The old connection remains usable until the
+        // replacement has authenticated.
         assert!(
             relay_server
                 .relay_service()
