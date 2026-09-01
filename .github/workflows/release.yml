@@ -86,13 +86,17 @@ jobs:
       - name: Create GitHub release
         id: release
         if: github.event.inputs.create_release == 'true' || github.event_name == 'push'
-        uses: actions/create-release@0cb9c9b65d5d1901c1f53e5e66eaf4afd303e70e
+        shell: bash
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          draft: true
-          tag_name: ${{ steps.release_version.outputs.value }}
-          release_name: ${{ steps.release_version.outputs.value }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.release_version.outputs.value }}
+        run: |
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --title "$RELEASE_TAG"
+          upload_url="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.upload_url')"
+          printf 'upload_url=%s\n' "$upload_url" >> "$GITHUB_OUTPUT"
 
     build_release:
         if: github.repository == 'manaflow-ai/iroh'
