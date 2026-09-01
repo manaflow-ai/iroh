@@ -335,7 +335,8 @@ jobs:
       # runner after the complete build matrix succeeds.
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
-        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' && inputs.create_release == 'true'))
       needs: [create-release, build_release]
       permissions:
         contents: read
@@ -418,7 +419,9 @@ jobs:
       name: Publish release assets
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
-        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.upload_artifacts == 'true'))
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' && inputs.create_release == 'true' &&
+        inputs.upload_artifacts == 'true'))
       needs: [create-release, build_release]
       permissions:
         # Only this hosted job needs to mutate the release.
@@ -490,7 +493,8 @@ jobs:
     docker:
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
-        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
+        github.ref == 'refs/heads/main' && inputs.create_release == 'true'))
       needs: [build_release, publish-s3-binaries]
       uses: './.github/workflows/docker.yaml'
       secrets:
