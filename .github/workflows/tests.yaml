@@ -40,6 +40,7 @@ jobs:
   pick-runner:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     uses: "./.github/workflows/pick-runner.yml"
     with:
@@ -56,6 +57,7 @@ jobs:
   pick-runner-windows:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     uses: "./.github/workflows/pick-runner.yml"
     with:
@@ -77,6 +79,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(matrix.runs_on) }}
@@ -242,6 +245,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
@@ -381,6 +385,7 @@ jobs:
   minimal-crates:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -415,6 +420,7 @@ jobs:
     name: "Minimal Crates (Windows)"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}

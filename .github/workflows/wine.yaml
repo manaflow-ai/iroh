@@ -24,6 +24,7 @@ jobs:
   pick-runner:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     uses: "./.github/workflows/pick-runner.yml"
     with:
@@ -36,6 +37,7 @@ jobs:
     needs: pick-runner
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
     # runs-on: [self-hosted, linux, X64]

@@ -48,6 +48,7 @@ jobs:
   tests:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       (contains(github.event.pull_request.labels.*.name, 'flaky-test') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     uses: './.github/workflows/tests.yaml'
@@ -61,6 +62,7 @@ jobs:
     if: >-
       always() &&
       github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     permissions:
       actions: read

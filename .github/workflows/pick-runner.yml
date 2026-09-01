@@ -216,10 +216,11 @@ jobs:
           HOSTED_FALLBACK_RUNNER: ${{ inputs.hosted_fallback_runner }}
           BS_MATCH: ${{ inputs.blacksmith_busy_match }}
           ORG: ${{ inputs.org }}
-          TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
+          TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && github.event_name != 'merge_group' && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
           GH_TOKEN: >-
             ${{
               github.repository == 'manaflow-ai/iroh' &&
+              github.event_name != 'merge_group' &&
               (github.event_name != 'pull_request' && github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
               secrets.RUNNER_READ_TOKEN || github.token
             }}
