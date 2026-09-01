@@ -10,7 +10,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: wine-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Keep the pull_request and target lanes from cancelling one another.
+  group: wine-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:

@@ -22,7 +22,9 @@ permissions:
 # untrusted even when its branch is in this repository.
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Keep pull_request and pull_request_target runs independent. Otherwise a
+  # skipped target run can cancel the required pull_request check.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:

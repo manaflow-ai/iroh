@@ -19,27 +19,86 @@ permissions:
 
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
-  PR_REPOSITORY: ${{ github.repository }}
-  PR_REF: ${{ (inputs.pr_number && format('refs/pull/{0}/merge', inputs.pr_number)) || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
 
 jobs:
+  # Resolve and validate the PR with the base token before any privileged job
+  # can check out or execute its code. This also protects manual dispatches.
+  resolve_pr:
+    name: Validate docs PR
+    if: github.repository == 'manaflow-ai/iroh'
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      number: ${{ steps.resolve.outputs.number }}
+      ref: ${{ steps.resolve.outputs.ref }}
+    steps:
+      - name: Validate same-repository PR
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EVENT_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name || '' }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          EVENT_HEAD_USER: ${{ github.event.pull_request.user.login || '' }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]; then
+            echo "PR number must be a positive integer" >&2
+            exit 1
+          fi
+
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          base_repo=$(jq -r '.base.repo.full_name // empty' <<<"$pr")
+          base_repo_id=$(jq -r '.base.repo.id // empty' <<<"$pr")
+          head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$pr")
+          head_repo_id=$(jq -r '.head.repo.id // empty' <<<"$pr")
+          head_sha=$(jq -r '.head.sha // empty' <<<"$pr")
+          head_user=$(jq -r '.user.login // empty' <<<"$pr")
+          base_ref=$(jq -r '.base.ref // empty' <<<"$pr")
+          state=$(jq -r '.state // empty' <<<"$pr")
+          repository_id=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.id')
+
+          [[ "$base_repo" == "$GITHUB_REPOSITORY" && "$base_repo_id" == "$repository_id" ]] || {
+            echo "PR targets a different repository" >&2
+            exit 1
+          }
+          [[ "$head_repo" == "$GITHUB_REPOSITORY" && "$head_repo_id" == "$repository_id" ]] || {
+            echo "Documentation previews require a same-repository PR" >&2
+            exit 1
+          }
+          [[ "$base_ref" == "main" && "$state" == "open" && "$head_user" != "dependabot[bot]" ]] || {
+            echo "PR is not an eligible open main-branch preview" >&2
+            exit 1
+          }
+          if [[ -n "$EVENT_HEAD_REPO" && "$EVENT_HEAD_REPO" != "$head_repo" ]] ||
+             [[ -n "$EVENT_HEAD_SHA" && "$EVENT_HEAD_SHA" != "$head_sha" ]] ||
+             [[ -n "$EVENT_HEAD_USER" && "$EVENT_HEAD_USER" != "$head_user" ]]; then
+            echo "PR metadata changed while resolving" >&2
+            exit 1
+          fi
+
+          printf 'number=%s\n' "$PR_NUMBER" >>"$GITHUB_OUTPUT"
+          printf 'ref=refs/pull/%s/merge\n' "$PR_NUMBER" >>"$GITHUB_OUTPUT"
+
   preview_docs:
+    needs: resolve_pr
     permissions:
       contents: write
       issues: write
       pull-requests: write
     timeout-minutes: 30
     name: Docs preview
-    if: >-
-      github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+    if: ${{ github.repository == 'manaflow-ai/iroh' && needs.resolve_pr.result == 'success' }}
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
       SCCACHE_CACHE_SIZE: "10G"
-      PREVIEW_PATH: pr/${{ github.event.pull_request.number || inputs.pr_number }}/docs
+      PR_REPOSITORY: ${{ github.repository }}
+      PR_REF: ${{ needs.resolve_pr.outputs.ref }}
+      PREVIEW_PATH: pr/${{ needs.resolve_pr.outputs.number }}/docs
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -72,7 +131,7 @@ jobs:
       uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad
       id: fc
       with:
-        issue-number: ${{ github.event.pull_request.number || inputs.pr_number }}
+        issue-number: ${{ needs.resolve_pr.outputs.number }}
         comment-author: 'github-actions[bot]'
         body-includes: Documentation for this PR has been generated
 
@@ -84,7 +143,7 @@ jobs:
     - name: Create or Update Docs Comment
       uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9
       with:
-        issue-number: ${{ github.event.pull_request.number || inputs.pr_number }}
+        issue-number: ${{ needs.resolve_pr.outputs.number }}
         comment-id: ${{ steps.fc.outputs.comment-id }}
         body: |
           Documentation for this PR has been generated and is available at: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/${{ env.PREVIEW_PATH }}/iroh/

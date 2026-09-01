@@ -12,7 +12,8 @@ on:
       - main
 
 concurrency:
-  group: patchbay-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  # Do not let the skipped target lane cancel the required pull_request lane.
+  group: patchbay-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
