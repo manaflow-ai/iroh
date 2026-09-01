@@ -12,17 +12,23 @@ concurrency:
   group: beta-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
 jobs:
   tests:
     uses: './.github/workflows/tests.yaml'
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
     with:
       rust-version: beta
   notify:
     needs: tests
-    if: ${{ always() }}
+    if: always() && github.repository == 'manaflow-ai/iroh'
+    permissions: {}
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results
@@ -32,7 +38,7 @@ jobs:
           echo TESTS_RESULT=$result
           echo "TESTS_RESULT=$result" >>"$GITHUB_ENV"
       - name: Notify discord on failure
-        uses: n0-computer/discord-webhook-notify@v1
+        uses: n0-computer/discord-webhook-notify@1399c1b2d57cc05894d506d2cfdc33c5f012b993
         if: ${{ env.TESTS_RESULT == 'failure' }}
         with:
           severity: error
@@ -41,4 +47,3 @@ jobs:
             Rustc beta tests failed
             See https://github.com/${{ github.repository }}/actions/workflows/beta.yaml
           webhookUrl: ${{ secrets.DISCORD_N0_GITHUB_CHANNEL_WEBHOOK_URL }}
-

@@ -1,15 +1,26 @@
 name: CI
 
 on:
-  pull_request:
+  # This workflow intentionally uses pull_request_target. GitHub evaluates
+  # this file from the base branch, so a fork cannot replace runner labels or
+  # add secret-bearing steps. Untrusted PRs are rejected before runner
+  # selection; trusted repository events retain the persistent runner lanes.
+  pull_request_target:
     types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
   merge_group:
   push:
     branches:
       - main
 
+permissions:
+  contents: read
+
+# Pull-request jobs use hosted runners for untrusted sources. Target-triggered
+# jobs execute only trusted same-repository code; Dependabot is treated as
+# untrusted even when its branch is in this repository.
+
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -18,24 +29,66 @@ env:
   RUSTDOCFLAGS: -Dwarnings
   MSRV: "1.91"
   SCCACHE_CACHE_SIZE: "10G"
+  # Never let fork or Dependabot code write the default-branch compiler cache.
+  # Same-repository PRs and pushes retain the existing cache. Merge groups run
+  # synthetic PR code, so they use the same cache policy as external PRs.
+  SCCACHE_GHA_ENABLED: >-
+    ${{
+      github.event_name != 'merge_group' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') ||
+        (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      'on' || ''
+    }}
   IROH_FORCE_STAGING_RELAYS: "1"
+  # Use GitHub's generated merge commit for pull requests. It exists in the
+  # base repository, so target jobs never need to checkout a fork ref.
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
+  ALLOW_UNSAFE_PR_CHECKOUT: 'false'
 
 jobs:
   pick-runner:
+    if: github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   tests:
     name: CI Test Suite
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/tests.yaml"
+    with:
+      # Keep this job's stable check name for both trusted and external PRs.
+      # The reusable workflow switches every matrix cell to hosted runners for
+      # external and Dependabot sources.
+      hosted_only: >-
+        ${{
+          github.event_name == 'pull_request_target' &&
+          (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
+        }}
+    secrets:
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   cross_build:
     name: Cross Build Only
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
@@ -57,12 +110,16 @@ jobs:
           # - x86_64-unknown-netbsd
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
       - name: Cleanup Docker
         continue-on-error: true
@@ -72,27 +129,35 @@ jobs:
         # See https://github.com/cross-rs/cross/issues/1222
       - name: Cache cross
         id: cache-cross
-        uses: actions/cache@v5
+        if: >-
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') ||
+            (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ~/.cargo/bin/cross
           key: cross-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cross
         if: steps.cache-cross.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@cross
+        uses: taiki-e/install-action@4c3077a2f3b1c97b8dafdaeff6841931e3674b06
 
       - name: build
         # cross tests are currently broken vor armv7 and aarch64
         # see https://github.com/cross-rs/cross/issues/1311.  So on
         # those platforms we only build but do not run tests.
-        run: cross build --all --target ${{ matrix.target }}
+        run: cross build --all --target "$TARGET"
         env:
+          TARGET: ${{ matrix.target }}
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
 
   android:
     name: Android Build & Test
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 60
     # runs-on: [self-hosted, linux, X64]
     needs: pick-runner
@@ -107,7 +172,12 @@ jobs:
             api-level: 35
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Enable KVM for nested virtualization
         if: matrix.target == 'x86_64-linux-android'
@@ -118,22 +188,23 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           target: ${{ matrix.target }}
 
       - name: Setup Java
-        uses: actions/setup-java@v5
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
         with:
           distribution: "temurin"
           java-version: "17"
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v4
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699
 
       # Pinned to a release tag (rather than @main) for supply-chain hygiene.
       - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
+        # Pin the installer commit. The release tag is mutable.
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779
         id: setup-ndk
         with:
           ndk-version: r25c
@@ -162,9 +233,9 @@ jobs:
       - name: Build
         if: matrix.target != 'x86_64-linux-android'
         env:
+          TARGET: ${{ matrix.target }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: cargo ndk --target ${{ matrix.target }} build
-
+        run: cargo ndk --target "$TARGET" build
       # Build all the test binaries up front so the emulator boot can
       # overlap with compilation. cargo-ndk runs `cargo test --no-run`
       # against each crate; the binaries land in
@@ -182,7 +253,7 @@ jobs:
 
       - name: Run workspace tests on Android emulator
         if: matrix.target == 'x86_64-linux-android'
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
           # Forwarded into the emulator by the cargo-ndk-runner wrapper.
@@ -223,7 +294,10 @@ jobs:
 
   cross_test:
     name: Cross Test
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_3) }}
@@ -237,12 +311,16 @@ jobs:
       RUSTFLAGS: "-Dwarnings --cfg skip_patchbay"
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           submodules: recursive
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
       - name: Cleanup Docker
         continue-on-error: true
@@ -252,23 +330,31 @@ jobs:
         # See https://github.com/cross-rs/cross/issues/1222
       - name: Cache cross
         id: cache-cross
-        uses: actions/cache@v5
+        if: >-
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') ||
+            (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ~/.cargo/bin/cross
           key: cross-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install cross
         if: steps.cache-cross.outputs.cache-hit != 'true'
-        uses: taiki-e/install-action@cross
+        uses: taiki-e/install-action@4c3077a2f3b1c97b8dafdaeff6841931e3674b06
 
       - name: test
-        run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
+        run: cross test --all --target "$TARGET" -- --test-threads=12
         env:
+          TARGET: ${{ matrix.target }}
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
 
   wasm_test:
     name: Build & test wasm32 for browsers
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_4) }}
     # runs-on: [self-hosted, linux, X64]
@@ -276,27 +362,32 @@ jobs:
       RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
         with:
           node-version: 22.5
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
 
       - name: Install wasm-bindgen-test-runner
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           # Match the version of wasm-bindgen used in Cargo.lock
           tool: wasm-bindgen-cli@0.2.122
 
       - name: Install wasm-tools
-        uses: bytecodealliance/actions/wasm-tools/setup@v1
+        uses: bytecodealliance/actions/wasm-tools/setup@9152e710e9f7182e4c29ad218e4f335a7b203613
 
       - name: wasm32 build (iroh-base)
         run: cargo build --target wasm32-unknown-unknown -p iroh-base --all-features
@@ -321,49 +412,59 @@ jobs:
         run: cargo test -p iroh --test integration --target=wasm32-unknown-unknown
 
   check_semver:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_5) }}
     # runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 0
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
-      - name: Setup Environment (PR)
-        if: ${{ github.event_name == 'pull_request' }}
+      - name: Select semver baseline
+        id: semver_baseline
         shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/${{ github.base_ref }})" >> ${GITHUB_ENV}
-      - name: Setup Environment (Push)
-        if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
-        shell: bash
-        run: |
-          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
+          if [[ -n "$PR_BASE_SHA" ]]; then
+            printf 'sha=%s\n' "$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            printf 'sha=%s\n' "$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+          fi
       - name: Check semver
-        # uses: obi1kenobi/cargo-semver-checks-action@v2
-        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        # uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239
+        # Pin the in-org action branch to an immutable commit.
+        uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f
         with:
           package: iroh, iroh-base, iroh-dns, iroh-dns-server, iroh-relay
-          baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
+          baseline-rev: ${{ steps.semver_baseline.outputs.sha }}
           use-cache: false
 
   check_external_types:
     timeout-minutes: 30
     name: Check external types in public API
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_9) }}
     # runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
       # The tool drives an internal rustdoc invocation that only emits JSON
       # for the analyzer, so the workflow-wide `-Dwarnings` would just turn
       # unrelated rustdoc lints (e.g. `private-intra-doc-links`) into hard
@@ -374,15 +475,20 @@ jobs:
       CARGO_CHECK_EXTERNAL_TYPES_VERSION: "0.5.0"
       TOOLCHAIN: "nightly-2026-03-20"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.TOOLCHAIN }}
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
 
       - name: Install cargo-check-external-types
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: |
             cargo-make
@@ -394,38 +500,53 @@ jobs:
   check_fmt:
     timeout-minutes: 30
     name: Checking fmt
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: rustfmt
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
-      - uses: taiki-e/install-action@cargo-make
+      - uses: taiki-e/install-action@a02c311696fe4e2cac5d6aef78eed5e93e7c0492
       - run: cargo make format-check
 
   check_docs:
     timeout-minutes: 30
     name: Checking docs
     needs: pick-runner
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_6) }}
     # runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
       RUSTDOCFLAGS: --cfg docsrs
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2025-10-09
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
@@ -434,19 +555,26 @@ jobs:
 
   clippy_check:
     timeout-minutes: 30
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_7) }}
     # runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
         with:
           components: clippy
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
@@ -464,10 +592,19 @@ jobs:
   check_optional_deps:
     timeout-minutes: 10
     name: Check optional deps are absent without features
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
       - name: Verify optional deps are absent without features
         run: |
           fail=0
@@ -483,7 +620,10 @@ jobs:
           exit $fail
 
   msrv:
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     name: Minimal Supported Rust Version
     needs: pick-runner
@@ -491,14 +631,18 @@ jobs:
     # runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.MSRV }}
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
@@ -509,35 +653,72 @@ jobs:
   cargo_deny:
     timeout-minutes: 30
     name: cargo deny
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
         with:
           arguments: --workspace --all-features
           command: check
           command-arguments: "-Dwarnings"
 
   netsim-integration-tests:
-    permissions: write-all
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    permissions:
+      contents: read
+      # Netsim uploads reports and comments on trusted pull requests.
+      issues: write
+      pull-requests: write
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/netsim_runner.yaml"
-    secrets: inherit
+    secrets:
+      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_REPORT_BUCKET: ${{ secrets.S3_REPORT_BUCKET }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      METRO_TOKEN: ${{ secrets.METRO_TOKEN }}
+      METRO_ENDPOINT: ${{ secrets.METRO_ENDPOINT }}
     with:
-      branch: ${{ github.ref }}
+      branch: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
       max_workers: 6
       netsim_branch: "main"
-      sim_paths: ${{ github.event_name == 'pull_request' && 'sims/integration' || 'sims/iroh/iroh.json,sims/integration' }}
+      sim_paths: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && 'sims/integration' || 'sims/iroh/iroh.json,sims/integration' }}
       pr_number: ${{ github.event.pull_request.number || '' }}
-      filter: ${{ github.event_name == 'pull_request' && 'skip:intg_iroh_full__1_to_3,intg_iroh_full__1_to_1x3,intg_iroh_relay_only__1_to_3' || '' }}
+      filter: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && 'skip:intg_iroh_full__1_to_3,intg_iroh_full__1_to_1x3,intg_iroh_relay_only__1_to_3' || '' }}
 
   codespell:
     timeout-minutes: 30
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
       - name: Cache pip
-        uses: actions/cache@v5
+        if: >-
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') ||
+            (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ~/.cache/pip
           key: pip-codespell-2.4.1

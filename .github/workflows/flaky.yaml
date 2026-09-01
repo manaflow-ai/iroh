@@ -20,7 +20,8 @@
 name: Flaky CI
 
 on:
-  pull_request:
+  # Use the base-branch workflow before selecting self-hosted runners.
+  pull_request_target:
     types: [ 'labeled', 'unlabeled', 'opened', 'synchronize', 'reopened' ]
   schedule:
     # 06:30 UTC every day
@@ -40,26 +41,42 @@ concurrency:
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
+permissions:
+  contents: read
+
 jobs:
   tests:
-    if: "contains(github.event.pull_request.labels.*.name, 'flaky-test') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      (contains(github.event.pull_request.labels.*.name, 'flaky-test') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     uses: './.github/workflows/tests.yaml'
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
     with:
       flaky: true
       git-ref: ${{ inputs.branch }}
   notify:
     needs: tests
-    if: ${{ always() }}
+    if: >-
+      always() &&
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+    permissions:
+      actions: read
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results
+        id: extract_results
         run: |
           printf '${{ toJSON(needs) }}\n'
           result=$(echo '${{ toJSON(needs) }}' | jq -r .tests.result)
           echo TESTS_RESULT=$result
-          echo "TESTS_RESULT=$result" >>"$GITHUB_ENV"
+          printf 'result=%s\n' "$result" >> "$GITHUB_OUTPUT"
       - name: download nextest reports
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
         with:
           pattern: libtest_run_${{ github.run_number }}-${{ github.run_attempt }}-*
           merge-multiple: true
@@ -90,10 +107,10 @@ jobs:
           echo "See https://github.com/${{ github.repository }}/actions/workflows/flaky.yaml" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
       - name: Notify discord on failure
-        uses: n0-computer/discord-webhook-notify@v1
-        if: ${{ env.TESTS_RESULT == 'failure' || env.TESTS_RESULT == 'success' }}
+        uses: n0-computer/discord-webhook-notify@1399c1b2d57cc05894d506d2cfdc33c5f012b993
+        if: ${{ steps.extract_results.outputs.result == 'failure' || steps.extract_results.outputs.result == 'success' }}
         with:
           text: "Flaky tests in **${{ github.repository }}**:"
-          severity: ${{ env.TESTS_RESULT == 'failure' && 'warn' || 'info' }}
-          details: ${{ env.TESTS_RESULT == 'failure' && steps.make_summary.outputs.summary || 'No flaky failures!' }}
+          severity: ${{ steps.extract_results.outputs.result == 'failure' && 'warn' || 'info' }}
+          details: ${{ steps.extract_results.outputs.result == 'failure' && steps.make_summary.outputs.summary || 'No flaky failures!' }}
           webhookUrl: ${{ secrets.DISCORD_N0_GITHUB_CHANNEL_WEBHOOK_URL }}

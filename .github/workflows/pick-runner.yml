@@ -6,25 +6,26 @@
 # HOW ROUTING WORKS:
 #   pick-runner queries self-hosted linux X64 idle count once at dispatch
 #   time, then emits up to 16 per-slot runs-on arrays (`overflow_1` through
-#   `overflow_16`). Each caller job picks a slot number; the first `idle`
-#   slots resolve to self-hosted, the rest resolve to Blacksmith-4vcpu.
+#   `overflow_16`). Each caller job picks a slot number; trusted runs use the
+#   first `idle` slots for self-hosted work and route the rest to the configured
+#   overflow runner.
 #
 #   Example, with idle=2 and 5 overflow jobs (slots 1..5):
 #     slot 1 → self-hosted       (1 <= 2)
 #     slot 2 → self-hosted       (2 <= 2)
-#     slot 3 → Blacksmith        (3 > 2)
-#     slot 4 → Blacksmith
-#     slot 5 → Blacksmith
+#     slot 3 → overflow           (3 > 2)
+#     slot 4 → overflow
+#     slot 5 → overflow
 #
 #   MIN_FREE_RUNNERS acts as a quality gate: if idle < min_free_runners, we
-#   don't spread at all and send the whole batch to Blacksmith. This avoids
+#   don't spread at all and send the whole batch to hosted runners. This avoids
 #   stranding a single job on a nearly-full self-hosted pool where the batch
 #   wall-clock would be dominated by that one job's queue wait.
 #
 # CALLER PATTERN:
 #   jobs:
 #     pick-runner:
-#       uses: n0-computer/tools/.github/workflows/pick-runner.yml@main
+#       uses: ./.github/workflows/pick-runner.yml
 #       with:
 #         min_free_runners: 3
 #       secrets:
@@ -56,9 +57,15 @@
 #          aren't available — note `read:org` alone is NOT sufficient for
 #          this endpoint, despite the name).
 #        - GitHub App: Organization permissions → Self-hosted runners: Read.
-#      Without the secret, pick-runner falls back to all-self-hosted (safe).
+#      Without the secret, pick-runner falls back to hosted runners. A failed
+#      availability query must never route untrusted code to a persistent host.
 
 name: Pick runner (reusable, per-slot)
+
+permissions:
+  contents: read
+  # The picker reads runner availability through the optional scoped secret.
+  actions: read
 
 on:
   workflow_call:
@@ -86,6 +93,10 @@ on:
         description: JSON array for overflow slots that land on Blacksmith
         type: string
         default: '["blacksmith-4vcpu-ubuntu-2204"]'
+      hosted_fallback_runner:
+        description: JSON array with one GitHub-hosted label for fail-closed routing
+        type: string
+        default: '["ubuntu-latest"]'
       blacksmith_busy_match:
         description: >
           Substring a busy Blacksmith runner's labels must contain to count
@@ -103,7 +114,7 @@ on:
         default: 10
     outputs:
       core:
-        description: JSON array for `runs-on` — always self-hosted
+        description: JSON array for `runs-on`; hosted fallback for untrusted or unavailable sources
         value: ${{ jobs.pick.outputs.core }}
       idle:
         description: Idle self-hosted linux X64 runners at decision time
@@ -168,6 +179,10 @@ on:
 jobs:
   pick:
     name: Pick runner (live availability, per-slot)
+    # This routing job always runs on GitHub-hosted infrastructure. External
+    # pull requests are handled without the runner-read secret and resolve all
+    # slots to the hosted fallback below.
+    if: github.repository == 'manaflow-ai/iroh'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
@@ -198,72 +213,113 @@ jobs:
           MAX_BLACKSMITH_CONCURRENT: ${{ inputs.max_blacksmith_concurrent }}
           CORE_RUNNER: ${{ inputs.core_runner }}
           OVERFLOW_RUNNER: ${{ inputs.overflow_runner }}
+          HOSTED_FALLBACK_RUNNER: ${{ inputs.hosted_fallback_runner }}
           BS_MATCH: ${{ inputs.blacksmith_busy_match }}
           ORG: ${{ inputs.org }}
-          GH_TOKEN: ${{ secrets.RUNNER_READ_TOKEN || github.token }}
+          TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && github.event_name != 'merge_group' && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
+          GH_TOKEN: >-
+            ${{
+              github.repository == 'manaflow-ai/iroh' &&
+              github.event_name != 'merge_group' &&
+              (github.event_name != 'pull_request' && github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+              (secrets.RUNNER_READ_TOKEN || github.token) || ''
+            }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "core=${CORE_RUNNER}" >> "$GITHUB_OUTPUT"
+          # Keep the fail-closed route on a known GitHub-hosted label. The
+          # allowlist prevents a caller typo from turning the fallback into a
+          # self-hosted label. Invalid input uses the safest Linux default.
+          if ! HOSTED_RUNNER="$(jq -cn --argjson candidate "$HOSTED_FALLBACK_RUNNER" '
+            if (($candidate | type) == "array"
+                and ($candidate | length) == 1
+                and (["ubuntu-latest","ubuntu-24.04","ubuntu-22.04",
+                      "windows-latest","windows-2025","windows-2022",
+                      "macos-latest","macos-26","macos-15","macos-14","macos-13"]
+                    | index($candidate[0]) != null))
+            then $candidate
+            else ["ubuntu-latest"]
+            end' 2>/dev/null)"; then
+            HOSTED_RUNNER='["ubuntu-latest"]'
+          fi
+          EFFECTIVE_CORE_RUNNER="$CORE_RUNNER"
+          EFFECTIVE_OVERFLOW_RUNNER="$OVERFLOW_RUNNER"
+          IDLE="unknown"
+          BS_BUSY="unknown"
+          SELF_HOSTED_SLOTS=0
 
-          # One paginated fetch, counted twice. Avoid a second round-trip.
-          RUNNERS_JSON="$(gh api "/orgs/${ORG}/actions/runners" --paginate 2>/dev/null || echo '')"
-
-          IDLE="$(echo "$RUNNERS_JSON" | jq -s --argjson want "$CORE_RUNNER" '[.[] | .runners[]?]
-                 | [.[] | select(.status=="online" and .busy==false
-                                 and ([.labels[].name | ascii_downcase]
-                                      | contains($want | map(ascii_downcase))))]
-                 | length' 2>/dev/null || echo "")"
-
-          # Count busy runners whose labels include a "blacksmith-" prefixed
-          # label AND a label containing $BS_MATCH (e.g. "ubuntu"/"windows"), so
-          # each platform's cap counts only its own Blacksmith runners.
-          # Blacksmith runners are ephemeral — they only exist while executing a
-          # job, so busy==true is always the relevant state.
-          BS_BUSY="$(echo "$RUNNERS_JSON" | jq -s --arg os "$BS_MATCH" '[.[] | .runners[]?]
-                    | [.[] | select(.busy==true
-                                    and ([.labels[].name | ascii_downcase] | any(startswith("blacksmith-")))
-                                    and ([.labels[].name | ascii_downcase] | any(contains($os | ascii_downcase)))) ]
-                    | length' 2>/dev/null || echo "")"
-
-          # Decide how many slots get self-hosted.
-          #
-          #   API failed              -> all self-hosted (safe default)
-          #   blacksmith at cap       -> all self-hosted (prevent runaway spend)
-          #   idle < min threshold    -> all Blacksmith (don't strand jobs)
-          #   idle >= min threshold   -> first `idle` slots self-hosted, rest Blacksmith
-          if [[ -z "$IDLE" || ! "$IDLE" =~ ^[0-9]+$ ]]; then
-            echo "::warning::runner availability query failed; defaulting to all self-hosted"
-            IDLE="unknown"
-            BS_BUSY="unknown"
-            SELF_HOSTED_SLOTS=16
-            ROUTE="all self-hosted (api-failed)"
-          elif (( MAX_BLACKSMITH_CONCURRENT > 0 )) && [[ "$BS_BUSY" =~ ^[0-9]+$ ]] && (( BS_BUSY >= MAX_BLACKSMITH_CONCURRENT )); then
-            SELF_HOSTED_SLOTS=16
-            ROUTE="all self-hosted (blacksmith at cap: bs_busy=${BS_BUSY} >= max=${MAX_BLACKSMITH_CONCURRENT})"
-          elif (( IDLE < MIN_FREE_RUNNERS )); then
-            SELF_HOSTED_SLOTS=0
-            ROUTE="all Blacksmith (idle=${IDLE} < min=${MIN_FREE_RUNNERS})"
+          # A pull request from another repository is untrusted, even when its
+          # workflow runs in this repository. Keep it on an ephemeral hosted
+          # runner. The repository check also prevents a copied workflow in a
+          # fork from selecting the organization's runner pool.
+          if [[ "$TRUSTED_SOURCE" != "true" ]]; then
+            EFFECTIVE_CORE_RUNNER="$HOSTED_RUNNER"
+            EFFECTIVE_OVERFLOW_RUNNER="$HOSTED_RUNNER"
+            ROUTE="all hosted (untrusted source)"
+          elif ! RUNNERS_JSON="$(gh api "/orgs/${ORG}/actions/runners" --paginate 2>/dev/null)"; then
+            EFFECTIVE_CORE_RUNNER="$HOSTED_RUNNER"
+            EFFECTIVE_OVERFLOW_RUNNER="$HOSTED_RUNNER"
+            ROUTE="all hosted (runner availability unavailable)"
+            echo "::warning::runner availability query failed; defaulting to hosted runners"
           else
-            SELF_HOSTED_SLOTS="$IDLE"
-            ROUTE="spread (idle=${IDLE}: first ${IDLE} slots self-hosted, rest Blacksmith)"
+            # One paginated fetch, counted twice. Avoid a second round-trip.
+            IDLE="$(echo "$RUNNERS_JSON" | jq -s --argjson want "$CORE_RUNNER" '[.[] | .runners[]?]
+                   | [.[] | select(.status=="online" and .busy==false
+                                   and ([.labels[].name | ascii_downcase]
+                                        | contains($want | map(ascii_downcase))))]
+                   | length' 2>/dev/null || echo "")"
+
+            # Count busy runners whose labels include a "blacksmith-" prefixed
+            # label and a label containing $BS_MATCH (for example, "ubuntu" or
+            # "windows"), so each platform's cap remains independent.
+            BS_BUSY="$(echo "$RUNNERS_JSON" | jq -s --arg os "$BS_MATCH" '[.[] | .runners[]?]
+                      | [.[] | select(.busy==true
+                                      and ([.labels[].name | ascii_downcase] | any(startswith("blacksmith-")))
+                                      and ([.labels[].name | ascii_downcase] | any(contains($os | ascii_downcase)))) ]
+                      | length' 2>/dev/null || echo "")"
+
+            # Decide how many slots get self-hosted.
+            #
+            #   API/JSON failed          -> all hosted (fail closed)
+            #   blacksmith at cap        -> all self-hosted (trusted source)
+            #   idle < min threshold     -> all hosted (avoid queue stranding)
+            #   idle >= min threshold    -> first `idle` slots self-hosted, rest overflow
+            if [[ -z "$IDLE" || ! "$IDLE" =~ ^[0-9]+$ || -z "$BS_BUSY" || ! "$BS_BUSY" =~ ^[0-9]+$ ]]; then
+              EFFECTIVE_CORE_RUNNER="$HOSTED_RUNNER"
+              EFFECTIVE_OVERFLOW_RUNNER="$HOSTED_RUNNER"
+              ROUTE="all hosted (runner availability invalid)"
+              echo "::warning::runner availability response was invalid; defaulting to hosted runners"
+            elif (( MAX_BLACKSMITH_CONCURRENT > 0 )) && (( BS_BUSY >= MAX_BLACKSMITH_CONCURRENT )); then
+              SELF_HOSTED_SLOTS=16
+              ROUTE="all self-hosted (blacksmith at cap: bs_busy=${BS_BUSY} >= max=${MAX_BLACKSMITH_CONCURRENT})"
+            elif (( IDLE < MIN_FREE_RUNNERS )); then
+              EFFECTIVE_CORE_RUNNER="$HOSTED_RUNNER"
+              EFFECTIVE_OVERFLOW_RUNNER="$HOSTED_RUNNER"
+              ROUTE="all hosted (idle=${IDLE} < min=${MIN_FREE_RUNNERS})"
+            else
+              SELF_HOSTED_SLOTS="$IDLE"
+              (( SELF_HOSTED_SLOTS > 16 )) && SELF_HOSTED_SLOTS=16
+              ROUTE="spread (idle=${IDLE}: first ${SELF_HOSTED_SLOTS} slots self-hosted, rest overflow)"
+            fi
           fi
 
-          for i in $(seq 1 16); do
-            if (( i <= SELF_HOSTED_SLOTS )); then
-              echo "overflow_${i}=${CORE_RUNNER}" >> "$GITHUB_OUTPUT"
-            else
-              echo "overflow_${i}=${OVERFLOW_RUNNER}" >> "$GITHUB_OUTPUT"
-            fi
-          done
-
-          echo "decision=${ROUTE}" >> "$GITHUB_OUTPUT"
-          echo "idle=${IDLE}" >> "$GITHUB_OUTPUT"
-          echo "blacksmith_busy=${BS_BUSY}" >> "$GITHUB_OUTPUT"
+          {
+            echo "core=${EFFECTIVE_CORE_RUNNER}"
+            for i in $(seq 1 16); do
+              if (( i <= SELF_HOSTED_SLOTS )); then
+                echo "overflow_${i}=${EFFECTIVE_CORE_RUNNER}"
+              else
+                echo "overflow_${i}=${EFFECTIVE_OVERFLOW_RUNNER}"
+              fi
+            done
+            echo "decision=${ROUTE}"
+            echo "idle=${IDLE}"
+            echo "blacksmith_busy=${BS_BUSY}"
+          } >> "$GITHUB_OUTPUT"
           echo "--------------------------------------------------------"
           echo "Idle self-hosted linux-X64: ${IDLE}  (min threshold: ${MIN_FREE_RUNNERS})"
           echo "Blacksmith runners busy:    ${BS_BUSY}  (max: ${MAX_BLACKSMITH_CONCURRENT})"
           echo "Self-hosted slots:          1..${SELF_HOSTED_SLOTS}"
-          echo "Blacksmith slots:           $((SELF_HOSTED_SLOTS+1))..16"
+          echo "Overflow slots:             $((SELF_HOSTED_SLOTS+1))..16"
           echo "Decision: ${ROUTE}"
           echo "--------------------------------------------------------"

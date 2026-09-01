@@ -52,11 +52,9 @@ on:
       max_workers:
         required: true
         type: number
-        default: 4
       netsim_branch:
         required: true
         type: string
-        default: "main"
       rust_log:
         description: "Custom RUST_LOG value (e.g. 'iroh=debug,noq=trace'). If empty, defaults to warn."
         required: false
@@ -87,6 +85,26 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      S3_ACCESS_KEY_ID:
+        required: false
+      S3_ACCESS_KEY:
+        required: false
+      S3_REPORT_BUCKET:
+        required: false
+      S3_BUCKET:
+        required: false
+      METRO_TOKEN:
+        required: false
+      METRO_ENDPOINT:
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: netsim-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   RUST_BACKTRACE: 1
@@ -98,34 +116,48 @@ env:
 
 jobs:
   netsim:
-    permissions: write-all
+    permissions:
+      contents: read
+      # These permissions are used only for trusted reports and PR comments.
+      issues: write
+      pull-requests: write
     name: Netsim
     timeout-minutes: 45
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: [self-hosted, linux, X64]
     steps:
     - name: Checkout
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         submodules: recursive
-        ref: ${{ inputs.branch }}
+        repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        ref: ${{ inputs.branch || github.event.pull_request.head.sha || github.sha }}
+        persist-credentials: false
 
     - name: Install rust stable
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
 
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.10
+      uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
       continue-on-error: true
     - uses: ./.github/workflows/sccache-probe
 
     - name: Build iroh
+      env:
+        BUILD_PROFILE: ${{ inputs.build_profile }}
       run: |
-        cargo build --profile ${{ inputs.build_profile }} --workspace --all-features --examples --bins
+        cargo build --profile "$BUILD_PROFILE" --workspace --all-features --examples --bins
 
     - name: Fetch netsim
+      env:
+        NETSIM_BRANCH: ${{ inputs.netsim_branch }}
       run: |
         cd ..
         rm -rf chuck
-        git clone --depth 1 --single-branch --branch ${{ inputs.netsim_branch }} https://github.com/n0-computer/chuck.git
+        git clone --depth 1 --single-branch --branch "$NETSIM_BRANCH" https://github.com/n0-computer/chuck.git
 
     - name: Install netsim deps
       run: |
@@ -141,25 +173,31 @@ jobs:
         cp -r .github/sims/paused/ ../chuck/netsim/sims/paused/
 
     - name: Copy binaries to right location
+      env:
+        BUILD_PROFILE: ${{ inputs.build_profile }}
       run: |
-        cp target/${{inputs.build_profile}}/examples/* ../chuck/netsim/bins/
-        cp target/${{inputs.build_profile}}/examples/transfer ../chuck/netsim/bins/iroh-transfer
-        cp target/${{inputs.build_profile}}/iroh-relay ../chuck/netsim/bins/iroh-relay
-        cp target/${{inputs.build_profile}}/iroh-dns-server ../chuck/netsim/bins/iroh-dns-server
+        cp "target/${BUILD_PROFILE}/examples/"* ../chuck/netsim/bins/
+        cp -- "target/${BUILD_PROFILE}/examples/transfer" ../chuck/netsim/bins/iroh-transfer
+        cp -- "target/${BUILD_PROFILE}/iroh-relay" ../chuck/netsim/bins/iroh-relay
+        cp -- "target/${BUILD_PROFILE}/iroh-dns-server" ../chuck/netsim/bins/iroh-dns-server
 
     - name: Get commit sha
       shell: bash
       run: |
-        echo "LAST_COMMIT_SHA=$(git rev-parse --short ${GITHUB_SHA})" >> ${GITHUB_ENV}
+        printf 'LAST_COMMIT_SHA=%s\n' "$(git rev-parse --short "$GITHUB_SHA")" >> "$GITHUB_ENV"
 
     - name: Run tests
       id: run_tests
       continue-on-error: true
+      env:
+        SIM_PATHS: ${{ inputs.sim_paths }}
+        RUST_LOG_VALUE: ${{ inputs.rust_log }}
+        TEST_FILTER: ${{ inputs.filter }}
+        MAX_WORKERS: ${{ inputs.max_workers }}
       run: |
         cd ../chuck/netsim
-        IFS=',' read -ra sim_paths <<< "${{ inputs.sim_paths }}"
-        rust_log="${{ inputs.rust_log }}"
-        filter="${{ inputs.filter }}"
+        IFS=',' read -ra sim_paths <<< "$SIM_PATHS"
+        filter="$TEST_FILTER"
         filter_flag=""
         if [[ -n "${filter}" ]]; then
           if [[ "${filter}" == skip:* ]]; then
@@ -170,11 +208,15 @@ jobs:
             filter_flag="--only=${filter}"
           fi
         fi
+        args=("--max-workers=$MAX_WORKERS" --integration)
+        if [[ -n "$filter_flag" ]]; then
+          args=("$filter_flag" "${args[@]}")
+        fi
         for sim_path in "${sim_paths[@]}"; do
-          if [[ -n "${rust_log}" ]]; then
-            sudo RUST_LOG="${rust_log}" python3 main.py ${filter_flag} --max-workers=${{ inputs.max_workers }} --integration $sim_path
+          if [[ -n "${RUST_LOG_VALUE}" ]]; then
+            sudo env RUST_LOG="$RUST_LOG_VALUE" python3 main.py "${args[@]}" "$sim_path"
           else
-            sudo python3 main.py ${filter_flag} --max-workers=${{ inputs.max_workers }} --integration $sim_path
+            sudo python3 main.py "${args[@]}" "$sim_path"
           fi
         done
 
@@ -184,20 +226,12 @@ jobs:
       run: |
         cd ../chuck/netsim
         python3 reports_csv.py --table > report_table.txt
-        python3 reports_csv.py --prom --commit ${{ env.LAST_COMMIT_SHA }} > report_prom.txt
-        python3 reports_csv.py --metro --commit ${{ env.LAST_COMMIT_SHA }} > report_metro.txt
-        python3 reports_csv.py --metro --integration --commit ${{ env.LAST_COMMIT_SHA }} > report_metro_integration.txt
-
-    - name: Cache AWS CLI
-      if: always()
-      id: cache-awscli
-      uses: actions/cache@v5
-      with:
-        path: ~/awscli
-        key: awscli-${{ runner.os }}-${{ runner.arch }}-v2
+        python3 reports_csv.py --prom --commit "$LAST_COMMIT_SHA" > report_prom.txt
+        python3 reports_csv.py --metro --commit "$LAST_COMMIT_SHA" > report_metro.txt
+        python3 reports_csv.py --metro --integration --commit "$LAST_COMMIT_SHA" > report_metro_integration.txt
 
     - name: Download awscli
-      if: always() && steps.cache-awscli.outputs.cache-hit != 'true'
+      if: always()
       run: |
         mkdir -p ~/awscli
         curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o ~/awscli/awscliv2.zip
@@ -209,17 +243,19 @@ jobs:
 
     - name: Upload report
       if: always()
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-west-2
+        REPORT_BUCKET: ${{ secrets.S3_BUCKET }}
+        REPORT_PATH_BUCKET: ${{ secrets.S3_REPORT_BUCKET }}
       run: |
-        export AWS_ACCESS_KEY_ID=${{secrets.S3_ACCESS_KEY_ID}}
-        export AWS_SECRET_ACCESS_KEY=${{secrets.S3_ACCESS_KEY}}
-        export AWS_DEFAULT_REGION=us-west-2
-
         cd ../chuck/netsim
 
-        aws_fname=${{ env.LAST_COMMIT_SHA }}.tar.gz
+        aws_fname="${LAST_COMMIT_SHA}.tar.gz"
         tar -cvzf report.tar.gz report_prom.txt report_table.txt report_metro.txt report_metro_integration.txt logs/ report/ viz/
-        if [[ -n "${{ secrets.S3_BUCKET }}" ]]; then
-          aws s3 cp ./report.tar.gz s3://${{secrets.S3_REPORT_BUCKET}}/$aws_fname --no-progress
+        if [[ -n "$REPORT_BUCKET" ]]; then
+          aws s3 cp ./report.tar.gz "s3://${REPORT_PATH_BUCKET}/${aws_fname}" --no-progress
         fi
 
     - name: Move report
@@ -229,7 +265,7 @@ jobs:
 
     - name: Upload report
       if: always()
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       id: upload-report
       with:
         name: netsim-report-${{ env.LAST_COMMIT_SHA }}
@@ -239,8 +275,10 @@ jobs:
 
     - name: Fail Job if Tests Failed
       if: ${{ steps.run_tests.outcome == 'failure' }}
+      env:
+        REPORT_URL: ${{ steps.upload-report.outputs.artifact-url }}
       run: |
-        echo "Tests failed. Report: ${{steps.upload-report.outputs.artifact-url}}"
+        echo "Tests failed. Report: $REPORT_URL"
         echo ""
         if [ -f ../chuck/netsim/logs/failed_tests.txt ]; then
           echo "=== FAILED TESTS ==="
@@ -250,7 +288,7 @@ jobs:
 
     - name: Find Docs Comment
       if: ${{ inputs.pr_number != '' }}
-      uses: peter-evans/find-comment@v4
+      uses: peter-evans/find-comment@b30e6a3c0ed37e7c023ccd3f1db5c6c0b0c23aad
       id: fc
       with:
         issue-number: ${{ inputs.pr_number }}
@@ -258,8 +296,10 @@ jobs:
         body-includes: Netsim report & logs for this PR have been generated
 
     - name: Create or Update Docs Comment
-      if: ${{ inputs.pr_number != '' && !github.event.pull_request.head.repo.fork }}
-      uses: peter-evans/create-or-update-comment@v5
+      if: >-
+        inputs.pr_number != '' &&
+        ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9
       with:
         issue-number: ${{ inputs.pr_number }}
         comment-id: ${{ steps.fc.outputs.comment-id }}
@@ -281,8 +321,10 @@ jobs:
         echo "EOFMARKER" >> ${GITHUB_OUTPUT}
 
     - name: Echo Report Table on PR
-      uses: peter-evans/create-or-update-comment@v5
-      if: ${{ inputs.pr_number != '' && inputs.report_table && !github.event.pull_request.head.repo.fork }}
+      uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9
+      if: >-
+        inputs.pr_number != '' && inputs.report_table &&
+        ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
       with:
         issue-number: ${{ inputs.pr_number }}
         body: |
@@ -291,15 +333,20 @@ jobs:
           ${{ steps.generate_report_table.outputs.NETSIM_REPORT }}
 
     - name: Publish metrics
-      if: ${{ inputs.publish_metrics && !github.event.pull_request.head.repo.fork }}
+      if: >-
+        inputs.publish_metrics &&
+        ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      env:
+        METRO_TOKEN: ${{ secrets.METRO_TOKEN }}
+        METRO_ENDPOINT: ${{ secrets.METRO_ENDPOINT }}
       run: |
         cd ../chuck/netsim
         d=$(cat report_metro.txt)
         metro_data=$(printf "%s\n " "$d")
-        curl -X POST -H  "Content-Type: application/json" -H "Authorization: Bearer ${{secrets.METRO_TOKEN}}" --data "$metro_data" ${{secrets.METRO_ENDPOINT}}
+        curl -X POST -H  "Content-Type: application/json" -H "Authorization: Bearer $METRO_TOKEN" --data "$metro_data" "$METRO_ENDPOINT"
         d=$(cat report_metro_integration.txt)
         metro_data=$(printf "%s\n " "$d")
-        curl -X POST -H  "Content-Type: application/json" -H "Authorization: Bearer ${{secrets.METRO_TOKEN}}" --data "$metro_data" ${{secrets.METRO_ENDPOINT}}
+        curl -X POST -H  "Content-Type: application/json" -H "Authorization: Bearer $METRO_TOKEN" --data "$metro_data" "$METRO_ENDPOINT"
 
     - name: Echo metrics (debug)
       run: |

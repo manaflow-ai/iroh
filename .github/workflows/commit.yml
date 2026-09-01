@@ -1,9 +1,13 @@
 name: Commits
 
 on:
+  # This checker is intentionally read-only and does not checkout or execute
+  # PR code. Keep one event so every PR gets one unambiguous check.
   pull_request:
     branches: [main]
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
 
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
@@ -14,6 +18,6 @@ jobs:
     steps:
       - name: check-for-cc
         id: check-for-cc
-        uses: agenthunt/conventional-commit-checker-action@v2.0.1
+        uses: agenthunt/conventional-commit-checker-action@f1823f632e95a64547566dcd2c7da920e67117ad
         with:
           pr-title-regex: "^(.+)(?:(([^)s]+)))?!?: (.+)"

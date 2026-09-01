@@ -1,13 +1,16 @@
 name: Patchbay Tests
 
 on:
-  pull_request:
+  # Keep this workflow base-controlled. Untrusted PRs are rejected before the
+  # runner picker, while trusted repository events may use self-hosted.
+  pull_request_target:
+    types: [opened, synchronize, reopened]
   push:
     branches:
       - main
 
 concurrency:
-  group: patchbay-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: patchbay-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -15,12 +18,69 @@ env:
   SCCACHE_CACHE_SIZE: "10G"
   IROH_FORCE_STAGING_RELAYS: "1"
   NEXTEST_VERSION: "0.9.80"
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
+
+permissions:
+  contents: read
 
 jobs:
+  # This lane is defined on the base branch and is the only path that executes
+  # fork code. It has a hosted runner, a read-only token, no secrets, and no
+  # persistent cache. The checkout opt-in is limited to this isolated lane.
+  fork_validation:
+    # Preserve the protected status-check context used by trusted runs.
+    name: Patchbay Tests
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name == 'pull_request_target' &&
+      (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - name: Checkout pull request merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+          # This is the reviewed, hosted-only fork-validation exception.
+          allow-unsafe-pr-checkout: true
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - name: Install cargo-make and cargo-nextest
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }},cargo-make
+      - name: Build patchbay tests
+        run: cargo make patchbay --no-run
+      - name: Run patchbay tests
+        run: cargo make patchbay
+
+  pick-runner:
+    if: github.repository == 'manaflow-ai/iroh'
+    uses: "./.github/workflows/pick-runner.yml"
+    with:
+      min_free_runners: 3
+    secrets:
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
+
   patchbay_tests:
     name: Patchbay Tests
     timeout-minutes: 15
-    runs-on: [self-hosted, linux, X64]
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+    needs: pick-runner
+    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
     env:
       RUSTC_WRAPPER: "sccache"
     steps:
@@ -28,13 +88,17 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         continue-on-error: true
 
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+      - uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
       - name: Install cargo-make and cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }},cargo-make
 
@@ -51,7 +115,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: patchbay-testdir-${{ github.sha }}
           path: |

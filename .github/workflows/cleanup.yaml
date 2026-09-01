@@ -12,20 +12,23 @@ concurrency:
   group: beta-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions: {}
+
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
 jobs:
   clean_docs_branch:
     permissions:
-      issues: write
       contents: write
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: generated-docs-preview
+          # This trusted maintenance job pushes the cleaned branch.
+          persist-credentials: true
       - name: Clean docs branch
         run: |
           git config user.name "github-actions[bot]"
@@ -42,7 +45,5 @@ jobs:
           git diff --cached --quiet && echo "Nothing to clean up" && exit 0
           git commit -m "Cleanup old docs"
           git push
-
-
 
 

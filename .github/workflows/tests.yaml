@@ -2,6 +2,9 @@
 
 name: Tests
 
+permissions:
+  contents: read
+
 on:
   workflow_call:
     inputs:
@@ -16,7 +19,15 @@ on:
       git-ref:
         description: "Which git ref to checkout"
         type: string
-        default: ${{ github.ref }}
+        default: ""
+      hosted_only:
+        description: "Run untrusted PR validation on GitHub-hosted runners only"
+        type: boolean
+        default: false
+    secrets:
+      RUNNER_READ_TOKEN:
+        description: PAT with read:org scope for runner availability query
+        required: false
 
 env:
   RUST_BACKTRACE: 1
@@ -26,32 +37,80 @@ env:
   CRATES_LIST: "iroh,iroh-bench,iroh-dns-server,iroh-relay"
   IROH_FORCE_STAGING_RELAYS: "1"
   NEXTEST_VERSION: "0.9.80"
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ inputs.git-ref || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
+  # All checkout refs are base-repository merge refs. Never opt out of
+  # checkout's fork protection in this reusable workflow.
+  # The caller is base-controlled. Fork validation opts into checkout of the
+  # merge ref only while all jobs are forced onto GitHub-hosted runners and the
+  # workflow has contents:read with no repository secrets.
+  ALLOW_UNSAFE_PR_CHECKOUT: ${{ inputs.hosted_only && 'true' || 'false' }}
 
 jobs:
   pick-runner:
+    if: >-
+      github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   # Windows overflow routing onto Blacksmith, with its own idle count and an
   # independent Blacksmith cap of 4 (see blacksmith_busy_match: windows).
   pick-runner-windows:
+    if: >-
+      github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","windows","x64"]'
       overflow_runner: '["blacksmith-4vcpu-windows-2025"]'
+      hosted_fallback_runner: '["windows-latest"]'
       blacksmith_busy_match: windows
       max_blacksmith_concurrent: 4
       min_free_runners: 1
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
+
+  # macOS is normally a persistent self-hosted lane. The picker changes every
+  # slot to macos-latest for fork and Dependabot PRs, while preserving the
+  # self-hosted route for trusted repository events.
+  pick-runner-macos:
+    if: >-
+      github.repository == 'manaflow-ai/iroh'
+    uses: "./.github/workflows/pick-runner.yml"
+    with:
+      core_runner: '["self-hosted","macOS","ARM64"]'
+      overflow_runner: '["self-hosted","macOS","ARM64"]'
+      hosted_fallback_runner: '["macos-latest"]'
+      blacksmith_busy_match: macos
+      max_blacksmith_concurrent: 0
+      min_free_runners: 0
+    secrets:
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   build_and_test_nix:
     timeout-minutes: 30
     name: "Tests"
-    needs: pick-runner
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+    needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
@@ -66,38 +125,38 @@ jobs:
               os: ubuntu-latest
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                                                                          
-              runs_on: ${{ needs.pick-runner.outputs.overflow_1 }}
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_1 }}
             - name: ubuntu-latest                                                                                                                                          
               features: none                                                                                                                                               
               os: ubuntu-latest       
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                   
-              runs_on: ${{ needs.pick-runner.outputs.overflow_2 }}
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_2 }}
             - name: ubuntu-latest                                                                                                                                          
               features: default
               os: ubuntu-latest                                                                                                                                            
               release-os: linux                                                                                     
               release-arch: amd64     
-              runs_on: ${{ needs.pick-runner.outputs.overflow_3 }}
-            # mac cells always stay on self-hosted mac (not in the routing pool)                                                                                           
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_3 }}
+            # mac cells use the picker so untrusted sources stay hosted.
             - name: macOS-arm-latest                                                                                                                                       
               features: all                                                                                                                                                
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                                                                           
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'                                                                                                                   
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_1 }}
             - name: macOS-arm-latest                                                                                
               features: none                                                                                                                                               
               os: macOS-latest
               release-os: darwin                                                                                                                                           
               release-arch: aarch64                                                                                 
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_2 }}
             - name: macOS-arm-latest                                                                                                                                       
               features: default
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                    
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_3 }}
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -114,22 +173,25 @@ jobs:
               # leave SCCACHE_GHA_ENABLED unset; sccache defaults to local disk                                                                                                
             fi     
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install ${{ matrix.rust }} rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ matrix.rust }}
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf
         with:
           tool: nextest@${{ env.NEXTEST_VERSION }}
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
@@ -180,7 +242,7 @@ jobs:
 
       - name: upload results
         if: ${{ failure() && inputs.flaky }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: libtest_run_${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}.json
           path: output
@@ -211,6 +273,9 @@ jobs:
   build_and_test_windows:
     timeout-minutes: 30
     name: "Tests"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -226,15 +291,15 @@ jobs:
           - name: windows-latest
             features: all
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_1 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_1 }}
           - name: windows-latest
             features: none
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_2 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_2 }}
           - name: windows-latest
             features: default
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_3 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_3 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).
@@ -251,9 +316,12 @@ jobs:
               # leave SCCACHE_GHA_ENABLED unset; sccache defaults to local disk
             fi
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install ${{ matrix.rust }}
         run: |
@@ -264,7 +332,11 @@ jobs:
 
       - name: Cache cargo-nextest
         id: cache-nextest
-        uses: actions/cache@v5
+        # A fork PR must not read or write the shared base-branch cache.
+        if: >-
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ~/.cargo/bin/cargo-nextest.exe
           key: nextest-windows-${{ env.NEXTEST_VERSION }}
@@ -297,11 +369,11 @@ jobs:
           }
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
         with:
           # Blacksmith's Windows image ships no pre-installed MSYS2 (C:\msys64),
           # so install it there. Self-hosted keeps the pre-installed one (faster).
@@ -337,7 +409,7 @@ jobs:
 
       - name: upload results
         if: ${{ failure() && inputs.flaky }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: libtest_run_${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}.json
           path: output
@@ -345,7 +417,11 @@ jobs:
           compression-level: 0
 
   minimal-crates:
-    runs-on: ${{ matrix.runner }}
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+    needs: [pick-runner, pick-runner-macos]
+    runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false
       matrix:
@@ -355,15 +431,20 @@ jobs:
             os: ubuntu-latest
             release-os: linux
             release-arch: amd64
-            runner: [self-hosted, linux, X64]
+            runner: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_10 }}
           - name: macOS-arm-latest
             os: macOS-latest
             release-os: darwin
             release-arch: aarch64
-            runner: [self-hosted, macOS, ARM64]
+            runner: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_4 }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
+      - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
       - name: cargo check
         run: |
           rm -f Cargo.lock
@@ -372,6 +453,9 @@ jobs:
   minimal-crates-windows:
     timeout-minutes: 30
     name: "Minimal Crates (Windows)"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -385,7 +469,7 @@ jobs:
           # distinct slot (4) so it can run alongside the 3 build cells
           - name: windows-latest
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_4 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_4 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).
@@ -402,9 +486,12 @@ jobs:
               # leave SCCACHE_GHA_ENABLED unset; sccache defaults to local disk
             fi
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install Rust nightly
         run: |
@@ -413,11 +500,11 @@ jobs:
           rustup set default-host ${{ matrix.target }}
 
       - name: Install sccache
-        uses: mozilla-actions/sccache-action@v0.0.10
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
         with:
           # Blacksmith's Windows image ships no pre-installed MSYS2 (C:\msys64),
           # so install it there. Self-hosted keeps the pre-installed one (faster).
