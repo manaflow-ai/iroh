@@ -262,27 +262,32 @@ jobs:
           if: matrix.os == 'macos-latest'
           run: sudo installer -pkg ~/awscli/AWSCLIV2.pkg -target /
 
-        - name: Set aws credentials
-          if: matrix.os != 'windows-latest'
-          run: |
-              echo "AWS_ACCESS_KEY_ID=${{secrets.S3_ACCESS_KEY_ID}}" >> $GITHUB_ENV
-              echo "AWS_SECRET_ACCESS_KEY=${{secrets.S3_ACCESS_KEY}}" >> $GITHUB_ENV
-              echo "AWS_DEFAULT_REGION=us-west-2" >> $GITHUB_ENV
-
         - name: push release
           if: matrix.os != 'windows-latest' && matrix.libc != 'musl'
+          env:
+            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+            AWS_DEFAULT_REGION: us-west-2
           run: |
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7} --no-progress
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7} --no-progress
 
         - name: push release latest
           if: matrix.os != 'windows-latest' && matrix.libc != 'musl' && (github.event.inputs.mark_latest == 'true' || github.event_name == 'push')
+          env:
+            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+            AWS_DEFAULT_REGION: us-west-2
           run: |
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-latest --no-progress
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-latest --no-progress
 
         - name: push docker release
           if: matrix.os == 'ubuntu-latest' && matrix.libc == 'musl'
+          env:
+            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+            AWS_DEFAULT_REGION: us-west-2
           run: |
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7} --no-progress
             aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7} --no-progress
