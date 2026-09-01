@@ -45,6 +45,13 @@ on:
         S3_ACCESS_KEY:
           required: false
 
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
@@ -54,13 +61,15 @@ jobs:
         contents: read
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
-        (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
       timeout-minutes: 30
       name: Docker
       runs-on: [self-hosted, linux, X64]
       steps:
         - name: Checkout
           uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+          with:
+            persist-credentials: false
 
         - name: Set up Docker Buildx
           uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e
@@ -76,15 +85,7 @@ jobs:
             mkdir -p bins/linux/amd64
             mkdir -p bins/linux/arm64
 
-        - name: Cache AWS CLI
-          id: cache-awscli
-          uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
-          with:
-            path: ~/awscli
-            key: awscli-${{ runner.os }}-${{ runner.arch }}-v2
-
         - name: Download awscli
-          if: steps.cache-awscli.outputs.cache-hit != 'true'
           run: |
             mkdir -p ~/awscli
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o ~/awscli/awscliv2.zip
@@ -93,19 +94,18 @@ jobs:
         - name: Install awscli
           run: sudo ~/awscli/aws/install --update
     
-        - name: Set aws credentials
-          run: |
-              echo "AWS_ACCESS_KEY_ID=${{secrets.S3_ACCESS_KEY_ID}}" >> $GITHUB_ENV
-              echo "AWS_SECRET_ACCESS_KEY=${{secrets.S3_ACCESS_KEY}}" >> $GITHUB_ENV
-              echo "AWS_DEFAULT_REGION=us-west-2" >> $GITHUB_ENV
-
         - name: Fetch release binaries
+          env:
+            BASE_HASH: ${{ inputs.base_hash }}
+            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+            AWS_DEFAULT_REGION: us-west-2
           run: |
-            aws s3 cp s3://vorc/iroh-relay-linux-amd64-musl-${{ inputs.base_hash }} bins/linux/amd64/iroh-relay
-            aws s3 cp s3://vorc/iroh-dns-server-linux-amd64-musl-${{ inputs.base_hash }} bins/linux/amd64/iroh-dns-server
+            aws s3 cp "s3://vorc/iroh-relay-linux-amd64-musl-${BASE_HASH}" bins/linux/amd64/iroh-relay
+            aws s3 cp "s3://vorc/iroh-dns-server-linux-amd64-musl-${BASE_HASH}" bins/linux/amd64/iroh-dns-server
 
-            aws s3 cp s3://vorc/iroh-relay-linux-aarch64-musl-${{ inputs.base_hash }} bins/linux/arm64/iroh-relay
-            aws s3 cp s3://vorc/iroh-dns-server-linux-aarch64-musl-${{ inputs.base_hash }} bins/linux/arm64/iroh-dns-server
+            aws s3 cp "s3://vorc/iroh-relay-linux-aarch64-musl-${BASE_HASH}" bins/linux/arm64/iroh-relay
+            aws s3 cp "s3://vorc/iroh-dns-server-linux-aarch64-musl-${BASE_HASH}" bins/linux/arm64/iroh-dns-server
 
         - name: Build Docker image (iroh-relay)
           uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a

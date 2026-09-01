@@ -2,6 +2,9 @@
 
 name: Tests
 
+permissions:
+  contents: read
+
 on:
   workflow_call:
     inputs:
@@ -16,7 +19,7 @@ on:
       git-ref:
         description: "Which git ref to checkout"
         type: string
-        default: ${{ github.ref }}
+        default: ""
     secrets:
       RUNNER_READ_TOKEN:
         description: PAT with read:org scope for runner availability query
@@ -30,18 +33,30 @@ env:
   CRATES_LIST: "iroh,iroh-bench,iroh-dns-server,iroh-relay"
   IROH_FORCE_STAGING_RELAYS: "1"
   NEXTEST_VERSION: "0.9.80"
+  PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+  PR_REF: ${{ inputs.git-ref || github.event.pull_request.head.sha || github.sha }}
 
 jobs:
   pick-runner:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   # Windows overflow routing onto Blacksmith, with its own idle count and an
   # independent Blacksmith cap of 4 (see blacksmith_busy_match: windows).
   pick-runner-windows:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","windows","x64"]'
@@ -50,14 +65,18 @@ jobs:
       max_blacksmith_concurrent: 4
       min_free_runners: 1
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   build_and_test_nix:
     timeout-minutes: 30
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -123,7 +142,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
 
       - name: Install ${{ matrix.rust }} rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -220,7 +241,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -263,7 +284,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
 
       - name: Install ${{ matrix.rust }}
         run: |
@@ -357,7 +380,7 @@ jobs:
   minimal-crates:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -376,6 +399,10 @@ jobs:
             runner: [self-hosted, macOS, ARM64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
       - name: cargo check
         run: |
@@ -387,7 +414,7 @@ jobs:
     name: "Minimal Crates (Windows)"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -420,7 +447,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: ${{ inputs.git-ref }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
+          persist-credentials: false
 
       - name: Install Rust nightly
         run: |

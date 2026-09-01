@@ -1,7 +1,9 @@
 name: Docs Preview
 
 on:
-  pull_request:
+  # This workflow writes the generated-docs branch. Keep its definition on the
+  # base branch and run it only for trusted same-repository pull requests.
+  pull_request_target:
   workflow_dispatch:
     inputs:
       pr_number:
@@ -11,6 +13,9 @@ on:
 # ensure job runs sequentially so pushing to the preview branch doesn't conflict
 concurrency:
   group: ci-docs-preview
+
+permissions:
+  contents: read
 
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
@@ -25,7 +30,7 @@ jobs:
     name: Docs preview
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
@@ -35,6 +40,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        ref: ${{ github.event.pull_request.head.sha || github.sha }}
+        persist-credentials: false
     - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
       with:
         toolchain: nightly-2025-10-09

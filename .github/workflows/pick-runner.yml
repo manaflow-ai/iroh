@@ -62,6 +62,10 @@
 
 name: Pick runner (reusable, per-slot)
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   workflow_call:
     inputs:
@@ -170,6 +174,10 @@ on:
 jobs:
   pick:
     name: Pick runner (live availability, per-slot)
+    # This routing job always runs on GitHub-hosted infrastructure. External
+    # pull requests are handled without the runner-read secret and resolve all
+    # slots to the hosted fallback below.
+    if: github.repository == 'manaflow-ai/iroh'
     runs-on: ubuntu-latest
     timeout-minutes: 2
     outputs:
@@ -202,8 +210,13 @@ jobs:
           OVERFLOW_RUNNER: ${{ inputs.overflow_runner }}
           BS_MATCH: ${{ inputs.blacksmith_busy_match }}
           ORG: ${{ inputs.org }}
-          TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-          GH_TOKEN: ${{ secrets.RUNNER_READ_TOKEN || github.token }}
+          TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
+          GH_TOKEN: >-
+            ${{
+              github.repository == 'manaflow-ai/iroh' &&
+              (github.event_name != 'pull_request' && github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+              secrets.RUNNER_READ_TOKEN || github.token
+            }}
         shell: bash
         run: |
           set -euo pipefail

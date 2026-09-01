@@ -1,9 +1,13 @@
 name: Commits
 
 on:
-  pull_request:
+  # Evaluate the base-branch workflow so a fork cannot add a privileged job.
+  pull_request_target:
     branches: [main]
     types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
 
 env:
   IROH_FORCE_STAGING_RELAYS: "1"

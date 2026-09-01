@@ -20,7 +20,8 @@
 name: Flaky CI
 
 on:
-  pull_request:
+  # Use the base-branch workflow before selecting self-hosted runners.
+  pull_request_target:
     types: [ 'labeled', 'unlabeled', 'opened', 'synchronize', 'reopened' ]
   schedule:
     # 06:30 UTC every day
@@ -40,11 +41,14 @@ concurrency:
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
+permissions:
+  contents: read
+
 jobs:
   tests:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       (contains(github.event.pull_request.labels.*.name, 'flaky-test') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule')
     uses: './.github/workflows/tests.yaml'
     secrets:
@@ -57,7 +61,7 @@ jobs:
     if: >-
       always() &&
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results
