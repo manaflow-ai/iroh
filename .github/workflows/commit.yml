@@ -1,13 +1,9 @@
 name: Commits
 
 on:
-  # Keep the check attached to the PR merge commit. This workflow has no
-  # secrets and no checkout, so the pull_request run is safe for forks.
+  # This checker is intentionally read-only and does not checkout or execute
+  # PR code. Keep one event so every PR gets one unambiguous check.
   pull_request:
-    branches: [main]
-    types: [opened, edited, synchronize, reopened]
-  # Evaluate the base-branch workflow as defense in depth for trusted events.
-  pull_request_target:
     branches: [main]
     types: [opened, edited, synchronize, reopened]
 

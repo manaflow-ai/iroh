@@ -1,16 +1,15 @@
 name: Wine Tests
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
   push:
     branches: [main]
+  # This workflow is base-controlled. External PR code is rejected before the
+  # picker and never receives the runner-read secret.
   pull_request_target:
     types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
-  # Keep the pull_request and target lanes from cancelling one another.
   group: wine-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -25,6 +24,49 @@ permissions:
   contents: read
 
 jobs:
+  # Base-controlled hosted validation for fork PRs. No secrets, write
+  # permissions, self-hosted labels, or persistent cache are available here.
+  fork_validation:
+    name: Wine Sanity Check (hosted fork)
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name == 'pull_request_target' &&
+      (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout pull request merge
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: ${{ github.repository }}
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+          # This is the reviewed, hosted-only fork-validation exception.
+          allow-unsafe-pr-checkout: true
+      - name: Install Wine
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo mkdir -pm755 /etc/apt/keyrings
+          sudo wget -O /etc/apt/keyrings/winehq-archive.key https://dl.winehq.org/wine-builds/winehq.key
+          sudo wget -NP /etc/apt/sources.list.d/ https://dl.winehq.org/wine-builds/ubuntu/dists/$(lsb_release -cs)/winehq-$(lsb_release -cs).sources
+          sudo apt-get update
+          sudo apt-get install -y --install-recommends winehq-stable || sudo apt-get install -y wine64 wine32
+          WINEARCH=win64 wineboot --init
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Install mingw-w64
+        run: sudo apt-get install -y mingw-w64
+      - name: Build tests
+        run: cargo build --target x86_64-pc-windows-gnu --tests --release
+      - name: Run tests under Wine
+        run: |
+          for exe in target/x86_64-pc-windows-gnu/release/deps/*.exe; do
+            wine "$exe" --test-threads=1
+          done
+
   pick-runner:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&

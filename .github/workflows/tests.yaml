@@ -20,6 +20,10 @@ on:
         description: "Which git ref to checkout"
         type: string
         default: ""
+      hosted_only:
+        description: "Run untrusted PR validation on GitHub-hosted runners only"
+        type: boolean
+        default: false
     secrets:
       RUNNER_READ_TOKEN:
         description: PAT with read:org scope for runner availability query
@@ -37,7 +41,10 @@ env:
   PR_REF: ${{ inputs.git-ref || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
   # All checkout refs are base-repository merge refs. Never opt out of
   # checkout's fork protection in this reusable workflow.
-  ALLOW_UNSAFE_PR_CHECKOUT: 'false'
+  # The caller is base-controlled. Fork validation opts into checkout of the
+  # merge ref only while all jobs are forced onto GitHub-hosted runners and the
+  # workflow has contents:read with no repository secrets.
+  ALLOW_UNSAFE_PR_CHECKOUT: ${{ inputs.hosted_only && 'true' || 'false' }}
 
 jobs:
   pick-runner:
@@ -102,7 +109,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -118,38 +125,38 @@ jobs:
               os: ubuntu-latest
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                                                                          
-              runs_on: ${{ needs.pick-runner.outputs.overflow_1 }}
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_1 }}
             - name: ubuntu-latest                                                                                                                                          
               features: none                                                                                                                                               
               os: ubuntu-latest       
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                   
-              runs_on: ${{ needs.pick-runner.outputs.overflow_2 }}
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_2 }}
             - name: ubuntu-latest                                                                                                                                          
               features: default
               os: ubuntu-latest                                                                                                                                            
               release-os: linux                                                                                     
               release-arch: amd64     
-              runs_on: ${{ needs.pick-runner.outputs.overflow_3 }}
+              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_3 }}
             # mac cells use the picker so untrusted sources stay hosted.
             - name: macOS-arm-latest                                                                                                                                       
               features: all                                                                                                                                                
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                                                                           
               release-arch: aarch64   
-              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_1 }}
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_1 }}
             - name: macOS-arm-latest                                                                                
               features: none                                                                                                                                               
               os: macOS-latest
               release-os: darwin                                                                                                                                           
               release-arch: aarch64                                                                                 
-              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_2 }}
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_2 }}
             - name: macOS-arm-latest                                                                                                                                       
               features: default
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                    
               release-arch: aarch64   
-              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_3 }}
+              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_3 }}
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -268,7 +275,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -284,15 +291,15 @@ jobs:
           - name: windows-latest
             features: all
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_1 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_1 }}
           - name: windows-latest
             features: none
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_2 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_2 }}
           - name: windows-latest
             features: default
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_3 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_3 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).
@@ -412,7 +419,7 @@ jobs:
   minimal-crates:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
@@ -424,12 +431,12 @@ jobs:
             os: ubuntu-latest
             release-os: linux
             release-arch: amd64
-            runner: ${{ needs.pick-runner.outputs.overflow_10 }}
+            runner: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_10 }}
           - name: macOS-arm-latest
             os: macOS-latest
             release-os: darwin
             release-arch: aarch64
-            runner: ${{ needs.pick-runner-macos.outputs.overflow_4 }}
+            runner: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_4 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -448,7 +455,7 @@ jobs:
     name: "Minimal Crates (Windows)"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      (inputs.hosted_only || github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -462,7 +469,7 @@ jobs:
           # distinct slot (4) so it can run alongside the 3 build cells
           - name: windows-latest
             os: windows
-            runs_on: ${{ needs.pick-runner-windows.outputs.overflow_4 }}
+            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_4 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).

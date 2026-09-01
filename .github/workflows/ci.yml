@@ -1,12 +1,10 @@
 name: CI
 
 on:
-  # pull_request keeps required checks attached to the PR merge commit and
-  # gives fork runs GitHub's read-only token and isolated cache scope.
-  pull_request:
-    types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
-  # The target trigger is used only for trusted same-repository jobs. Every
-  # target job below rejects fork and Dependabot code before checkout.
+  # This workflow intentionally uses pull_request_target. GitHub evaluates
+  # this file from the base branch, so a fork cannot replace runner labels or
+  # add secret-bearing steps. Untrusted PRs are rejected before runner
+  # selection; trusted repository events retain the persistent runner lanes.
   pull_request_target:
     types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
   merge_group:
@@ -22,8 +20,6 @@ permissions:
 # untrusted even when its branch is in this repository.
 
 concurrency:
-  # Keep pull_request and pull_request_target runs independent. Otherwise a
-  # skipped target run can cancel the required pull_request check.
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
@@ -78,6 +74,21 @@ jobs:
           ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
           secrets.RUNNER_READ_TOKEN || ''
         }}
+
+  # Fork validation is dispatched from this base-controlled workflow. The
+  # reusable workflow forces every matrix cell to a fresh GitHub-hosted runner,
+  # disables shared caches, and receives no repository secret.
+  fork_validation:
+    name: Fork validation (hosted)
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name == 'pull_request_target' &&
+      (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
+    uses: "./.github/workflows/tests.yaml"
+    with:
+      hosted_only: true
+    secrets:
+      RUNNER_READ_TOKEN: ''
 
   cross_build:
     name: Cross Build Only
