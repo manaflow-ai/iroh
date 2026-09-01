@@ -70,6 +70,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           fetch-depth: 1
+          persist-credentials: false
       - name: Create GitHub release
         id: release
         if: github.event.inputs.create_release == 'true' || github.event_name == 'push'
@@ -156,6 +157,7 @@ jobs:
           uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
           with:
             submodules: recursive
+            persist-credentials: false
 
         - name: Checkout specified commit
           if: inputs.base_hash != ''
@@ -163,6 +165,7 @@ jobs:
           with:
             ref: ${{ inputs.base_hash }}
             submodules: recursive
+            persist-credentials: false
 
         - name: Set build arch
           run: |
