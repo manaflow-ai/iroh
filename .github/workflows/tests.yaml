@@ -17,6 +17,10 @@ on:
         description: "Which git ref to checkout"
         type: string
         default: ${{ github.ref }}
+    secrets:
+      RUNNER_READ_TOKEN:
+        description: PAT with read:org scope for runner availability query
+        required: false
 
 env:
   RUST_BACKTRACE: 1
@@ -51,6 +55,9 @@ jobs:
   build_and_test_nix:
     timeout-minutes: 30
     name: "Tests"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -119,7 +126,7 @@ jobs:
           ref: ${{ inputs.git-ref }}
 
       - name: Install ${{ matrix.rust }} rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ matrix.rust }}
 
@@ -211,6 +218,9 @@ jobs:
   build_and_test_windows:
     timeout-minutes: 30
     name: "Tests"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -345,6 +355,9 @@ jobs:
           compression-level: 0
 
   minimal-crates:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -372,6 +385,9 @@ jobs:
   minimal-crates-windows:
     timeout-minutes: 30
     name: "Minimal Crates (Windows)"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:

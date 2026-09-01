@@ -30,12 +30,20 @@ jobs:
 
   tests:
     name: CI Test Suite
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/tests.yaml"
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
 
   cross_build:
     name: Cross Build Only
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
@@ -92,7 +100,10 @@ jobs:
 
   android:
     name: Android Build & Test
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 60
     # runs-on: [self-hosted, linux, X64]
     needs: pick-runner
@@ -133,7 +144,8 @@ jobs:
 
       # Pinned to a release tag (rather than @main) for supply-chain hygiene.
       - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
+        # Pin the installer commit. The release tag is mutable.
+        uses: nttld/setup-ndk@ed92fe6cadad69be94a966a7ee3271275e62f779
         id: setup-ndk
         with:
           ndk-version: r25c
@@ -223,7 +235,10 @@ jobs:
 
   cross_test:
     name: Cross Test
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_3) }}
@@ -269,6 +284,9 @@ jobs:
 
   wasm_test:
     name: Build & test wasm32 for browsers
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_4) }}
     # runs-on: [self-hosted, linux, X64]
@@ -321,6 +339,9 @@ jobs:
         run: cargo test -p iroh --test integration --target=wasm32-unknown-unknown
 
   check_semver:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_5) }}
     # runs-on: [self-hosted, linux, X64]
@@ -348,7 +369,8 @@ jobs:
           echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
       - name: Check semver
         # uses: obi1kenobi/cargo-semver-checks-action@v2
-        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        # Pin the in-org action branch to an immutable commit.
+        uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f
         with:
           package: iroh, iroh-base, iroh-dns, iroh-dns-server, iroh-relay
           baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
@@ -357,7 +379,10 @@ jobs:
   check_external_types:
     timeout-minutes: 30
     name: Check external types in public API
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_9) }}
     # runs-on: [self-hosted, linux, X64]
@@ -375,7 +400,7 @@ jobs:
       TOOLCHAIN: "nightly-2026-03-20"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.TOOLCHAIN }}
       - name: Install sccache
@@ -413,6 +438,9 @@ jobs:
     timeout-minutes: 30
     name: Checking docs
     needs: pick-runner
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_6) }}
     # runs-on: [self-hosted, linux, X64]
     env:
@@ -421,7 +449,7 @@ jobs:
       RUSTDOCFLAGS: --cfg docsrs
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: nightly-2025-10-09
       - name: Install sccache
@@ -434,6 +462,9 @@ jobs:
 
   clippy_check:
     timeout-minutes: 30
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_7) }}
     # runs-on: [self-hosted, linux, X64]
@@ -483,7 +514,10 @@ jobs:
           exit $fail
 
   msrv:
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     name: Minimal Supported Rust Version
     needs: pick-runner
@@ -494,7 +528,7 @@ jobs:
       SCCACHE_GHA_ENABLED: "on"
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: ${{ env.MSRV }}
       - name: Install sccache
@@ -519,10 +553,22 @@ jobs:
           command-arguments: "-Dwarnings"
 
   netsim-integration-tests:
-    permissions: write-all
-    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) &&
+      (github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/netsim_runner.yaml"
-    secrets: inherit
+    secrets:
+      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+      S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
+      S3_REPORT_BUCKET: ${{ secrets.S3_REPORT_BUCKET }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      METRO_TOKEN: ${{ secrets.METRO_TOKEN }}
+      METRO_ENDPOINT: ${{ secrets.METRO_ENDPOINT }}
     with:
       branch: ${{ github.ref }}
       max_workers: 6

@@ -47,6 +47,7 @@ env:
 
 jobs:
     create-release:
+      if: github.repository == 'manaflow-ai/iroh'
       name: create-release
       runs-on: ubuntu-latest
       outputs:
@@ -81,6 +82,7 @@ jobs:
           release_name: ${{ env.RELEASE_VERSION ||  github.event.inputs.release_version }}
 
     build_release:
+        if: github.repository == 'manaflow-ai/iroh'
         timeout-minutes: 60
         name: Build release binaries
         needs: create-release
@@ -305,7 +307,8 @@ jobs:
             $ASSETS = $ASSETS -join ','
             Add-Content -Path $env:GITHUB_ENV -Value "ASSET=$ASSETS"
 
-        - uses: n0-computer/actions-upload-release-asset@main
+        # Pin the in-org release uploader to an immutable commit.
+        - uses: n0-computer/actions-upload-release-asset@2613dacb5369f21a7e14f8eedce32ea9f88bb19f
           if: (github.event.inputs.upload_artifacts == 'true' || github.event_name == 'push')
           with:
             upload_url: ${{ github.event.inputs.upload_url || needs.create-release.outputs.upload_url }}
@@ -330,9 +333,14 @@ jobs:
             retention-days: 1
 
     docker:
+      if: github.repository == 'manaflow-ai/iroh'
       needs: build_release
       uses: './.github/workflows/docker.yaml'
-      secrets: inherit
+      secrets:
+        DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+        DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
+        S3_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
       with:
         release_version: ${{ needs.build_release.outputs.release_version }}
         base_hash: ${{ needs.build_release.outputs.base_hash }}

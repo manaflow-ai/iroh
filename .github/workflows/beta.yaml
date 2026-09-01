@@ -18,11 +18,13 @@ env:
 jobs:
   tests:
     uses: './.github/workflows/tests.yaml'
+    secrets:
+      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
     with:
       rust-version: beta
   notify:
     needs: tests
-    if: ${{ always() }}
+    if: always() && github.repository == 'manaflow-ai/iroh'
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results
@@ -41,4 +43,3 @@ jobs:
             Rustc beta tests failed
             See https://github.com/${{ github.repository }}/actions/workflows/beta.yaml
           webhookUrl: ${{ secrets.DISCORD_N0_GITHUB_CHANNEL_WEBHOOK_URL }}
-

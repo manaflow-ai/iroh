@@ -17,10 +17,15 @@ env:
 
 jobs:
   preview_docs:
-    permissions: write-all
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
     timeout-minutes: 30
     name: Docs preview
-    if: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' ) && !github.event.pull_request.head.repo.fork }}
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
@@ -30,7 +35,7 @@ jobs:
 
     steps:
     - uses: actions/checkout@v7
-    - uses: dtolnay/rust-toolchain@master
+    - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
       with:
         toolchain: nightly-2025-10-09
     - name: Install sccache

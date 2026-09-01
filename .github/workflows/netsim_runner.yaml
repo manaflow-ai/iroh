@@ -87,6 +87,19 @@ on:
         required: false
         type: string
         default: ""
+    secrets:
+      S3_ACCESS_KEY_ID:
+        required: false
+      S3_ACCESS_KEY:
+        required: false
+      S3_REPORT_BUCKET:
+        required: false
+      S3_BUCKET:
+        required: false
+      METRO_TOKEN:
+        required: false
+      METRO_ENDPOINT:
+        required: false
 
 env:
   RUST_BACKTRACE: 1
@@ -98,9 +111,15 @@ env:
 
 jobs:
   netsim:
-    permissions: write-all
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     name: Netsim
     timeout-minutes: 45
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, X64]
     steps:
     - name: Checkout

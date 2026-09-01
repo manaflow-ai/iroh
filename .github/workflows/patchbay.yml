@@ -20,6 +20,9 @@ jobs:
   patchbay_tests:
     name: Patchbay Tests
     timeout-minutes: 15
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
