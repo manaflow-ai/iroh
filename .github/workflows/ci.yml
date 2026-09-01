@@ -64,9 +64,17 @@ jobs:
     name: CI Test Suite
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/tests.yaml"
+    with:
+      # Keep this job's stable check name for both trusted and external PRs.
+      # The reusable workflow switches every matrix cell to hosted runners for
+      # external and Dependabot sources.
+      hosted_only: >-
+        ${{
+          github.event_name == 'pull_request_target' &&
+          (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
+        }}
     secrets:
       RUNNER_READ_TOKEN: >-
         ${{
@@ -74,21 +82,6 @@ jobs:
           ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
           secrets.RUNNER_READ_TOKEN || ''
         }}
-
-  # Fork validation is dispatched from this base-controlled workflow. The
-  # reusable workflow forces every matrix cell to a fresh GitHub-hosted runner,
-  # disables shared caches, and receives no repository secret.
-  fork_validation:
-    name: Fork validation (hosted)
-    if: >-
-      github.repository == 'manaflow-ai/iroh' &&
-      github.event_name == 'pull_request_target' &&
-      (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]')
-    uses: "./.github/workflows/tests.yaml"
-    with:
-      hosted_only: true
-    secrets:
-      RUNNER_READ_TOKEN: ''
 
   cross_build:
     name: Cross Build Only
