@@ -24,17 +24,14 @@ on:
           description: "Release version"
           required: true
           type: string
-          default: ""
         base_hash:
           description: "Commit hash from which to build"
           required: true
           type: string
-          default: ""
         publish:
           description: "Publish to Docker Hub"
           required: true
           type: boolean
-          default: false
       secrets:
         DOCKERHUB_USERNAME:
           required: false

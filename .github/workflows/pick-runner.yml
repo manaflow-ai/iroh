@@ -114,7 +114,7 @@ on:
         default: 10
     outputs:
       core:
-        description: JSON array for `runs-on` — always self-hosted
+        description: JSON array for `runs-on`; hosted fallback for untrusted or unavailable sources
         value: ${{ jobs.pick.outputs.core }}
       idle:
         description: Idle self-hosted linux X64 runners at decision time

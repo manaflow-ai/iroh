@@ -34,6 +34,8 @@ env:
   RUSTC_WRAPPER: "sccache"
   IROH_FORCE_STAGING_RELAYS: "1"
 
+permissions: {}
+
 jobs:
   netsim-release:
     permissions:

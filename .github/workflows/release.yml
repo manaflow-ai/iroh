@@ -36,6 +36,10 @@ concurrency:
   group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Release jobs declare the write scope they need. All other jobs receive no
+# repository token permissions by default.
+permissions: {}
+
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
@@ -49,23 +53,31 @@ jobs:
     create-release:
       if: github.repository == 'manaflow-ai/iroh'
       name: create-release
+      permissions:
+        contents: write
       runs-on: ubuntu-latest
       outputs:
         upload_url: ${{ steps.release.outputs.upload_url }}
-        release_version: ${{ env.RELEASE_VERSION }}
+        release_version: ${{ steps.release_version.outputs.value }}
       steps:
       - name: Get the release version from the tag or input
+        id: release_version
         shell: bash
-        if: env.RELEASE_VERSION == ''
+        env:
+          RELEASE_VERSION_INPUT: ${{ github.event.inputs.release_version }}
         run: |
-          if "${{ github.event.inputs.release_version }}" != ""; then
-            echo "RELEASE_VERSION=${{ github.event.inputs.release_version }}" >> $GITHUB_ENV
-            echo "version is: ${{ env.RELEASE_VERSION }}"
-          else
+          release_version="$RELEASE_VERSION_INPUT"
+          if [[ -z "$release_version" ]]; then
             # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
-            echo "RELEASE_VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-            echo "version is: ${{ env.RELEASE_VERSION }}"
+            release_version="${GITHUB_REF#refs/tags/}"
           fi
+          if [[ ! "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.+-]+)?$ ]]; then
+            echo "::error::release version must be a semantic version, got '$release_version'"
+            exit 1
+          fi
+          printf 'RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
+          printf 'value=%s\n' "$release_version" >> "$GITHUB_OUTPUT"
+          printf 'version is: %s\n' "$release_version"
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -79,11 +91,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           draft: true
-          tag_name: ${{ env.RELEASE_VERSION ||  github.event.inputs.release_version}}
-          release_name: ${{ env.RELEASE_VERSION ||  github.event.inputs.release_version }}
+          tag_name: ${{ steps.release_version.outputs.value }}
+          release_name: ${{ steps.release_version.outputs.value }}
 
     build_release:
         if: github.repository == 'manaflow-ai/iroh'
+        permissions:
+          contents: read
         timeout-minutes: 60
         name: Build release binaries
         needs: create-release
@@ -216,30 +230,22 @@ jobs:
           if: matrix.os == 'windows-latest'
           run: cargo build --profile optimized-release --all-features --target ${{ matrix.cargo_targets }}
 
-        - name: Cache AWS CLI
-          if: matrix.os != 'windows-latest'
-          id: cache-awscli
-          uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
-          with:
-            path: ~/awscli
-            key: awscli-${{ runner.os }}-${{ runner.arch }}-v2
-
         - name: Download awscli (linux x86_64)
-          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'amd64' && steps.cache-awscli.outputs.cache-hit != 'true'
+          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'amd64'
           run: |
             mkdir -p ~/awscli
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o ~/awscli/awscliv2.zip
             cd ~/awscli && unzip -oq awscliv2.zip
 
         - name: Download awscli (linux aarch64)
-          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'aarch64' && steps.cache-awscli.outputs.cache-hit != 'true'
+          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'aarch64'
           run: |
             mkdir -p ~/awscli
             curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o ~/awscli/awscliv2.zip
             cd ~/awscli && unzip -oq awscliv2.zip
 
         - name: Download awscli (mac)
-          if: matrix.os == 'macos-latest' && steps.cache-awscli.outputs.cache-hit != 'true'
+          if: matrix.os == 'macos-latest'
           run: |
             mkdir -p ~/awscli
             curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o ~/awscli/AWSCLIV2.pkg
