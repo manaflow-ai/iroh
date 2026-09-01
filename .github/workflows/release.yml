@@ -332,11 +332,14 @@ jobs:
       name: Publish release binaries
       # S3 publication is separate from all builds. This job is the only job
       # that receives the S3 credentials, and it runs on a versioned hosted
-      # runner after the complete build matrix succeeds.
+      # runner after the complete build matrix succeeds. A manual build-only
+      # dispatch skips publishing; an existing-release dispatch may provide
+      # upload_url without creating a second GitHub release.
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
         (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/main' && inputs.create_release == 'true'))
+        github.ref == 'refs/heads/main' &&
+        (inputs.create_release == 'true' || inputs.upload_url != '')))
       needs: [create-release, build_release]
       permissions:
         contents: read
@@ -420,7 +423,8 @@ jobs:
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
         (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/main' && inputs.create_release == 'true' &&
+        github.ref == 'refs/heads/main' &&
+        (inputs.create_release == 'true' || inputs.upload_url != '') &&
         inputs.upload_artifacts == 'true'))
       needs: [create-release, build_release]
       permissions:
@@ -494,7 +498,8 @@ jobs:
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
         (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' &&
-        github.ref == 'refs/heads/main' && inputs.create_release == 'true'))
+        github.ref == 'refs/heads/main' &&
+        (inputs.create_release == 'true' || inputs.upload_url != '')))
       needs: [build_release, publish-s3-binaries]
       uses: './.github/workflows/docker.yaml'
       secrets:
