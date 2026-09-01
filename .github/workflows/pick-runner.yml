@@ -64,6 +64,7 @@ name: Pick runner (reusable, per-slot)
 
 permissions:
   contents: read
+  # The picker reads runner availability through the optional scoped secret.
   actions: read
 
 on:

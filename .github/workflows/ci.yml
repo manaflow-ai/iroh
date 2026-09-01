@@ -124,8 +124,9 @@ jobs:
         # cross tests are currently broken vor armv7 and aarch64
         # see https://github.com/cross-rs/cross/issues/1311.  So on
         # those platforms we only build but do not run tests.
-        run: cross build --all --target ${{ matrix.target }}
+        run: cross build --all --target "$TARGET"
         env:
+          TARGET: ${{ matrix.target }}
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
 
@@ -209,9 +210,9 @@ jobs:
       - name: Build
         if: matrix.target != 'x86_64-linux-android'
         env:
+          TARGET: ${{ matrix.target }}
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
-        run: cargo ndk --target ${{ matrix.target }} build
-
+        run: cargo ndk --target "$TARGET" build
       # Build all the test binaries up front so the emulator boot can
       # overlap with compilation. cargo-ndk runs `cargo test --no-run`
       # against each crate; the binaries land in
@@ -318,8 +319,9 @@ jobs:
         uses: taiki-e/install-action@4c3077a2f3b1c97b8dafdaeff6841931e3674b06
 
       - name: test
-        run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
+        run: cross test --all --target "$TARGET" -- --test-threads=12
         env:
+          TARGET: ${{ matrix.target }}
           RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: cc
 
@@ -625,6 +627,7 @@ jobs:
   netsim-integration-tests:
     permissions:
       contents: read
+      # Netsim uploads reports and comments on trusted pull requests.
       issues: write
       pull-requests: write
     if: >-
