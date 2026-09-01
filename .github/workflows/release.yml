@@ -71,7 +71,9 @@ jobs:
             # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
             release_version="${GITHUB_REF#refs/tags/}"
           fi
-          if [[ ! "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.+-]+)?$ ]]; then
+          # Accept SemVer prerelease/build segments, but reject ambiguous
+          # dotted suffixes such as v1.2.3.foo.
+          if [[ ! "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
             echo "::error::release version must be a semantic version, got '$release_version'"
             exit 1
           fi
@@ -186,9 +188,12 @@ jobs:
             persist-credentials: false
 
         - name: Set build arch
+          env:
+            RELEASE_ARCH_VALUE: ${{ matrix.release-arch }}
+            RELEASE_OS_VALUE: ${{ matrix.release-os }}
           run: |
-            echo "RELEASE_ARCH=${{ matrix.release-arch }}" >> $GITHUB_ENV
-            echo "RELEASE_OS=${{ matrix.release-os }}" >> $GITHUB_ENV
+            printf 'RELEASE_ARCH=%s\n' "$RELEASE_ARCH_VALUE" >> "$GITHUB_ENV"
+            printf 'RELEASE_OS=%s\n' "$RELEASE_OS_VALUE" >> "$GITHUB_ENV"
 
         - name: Define hash
           if: matrix.os == 'ubuntu-latest'
@@ -209,17 +214,22 @@ jobs:
 
         - name: Install Rust
           if: matrix.os == 'windows-latest'
+          env:
+            TARGET: ${{ matrix.cargo_targets }}
           run: |
             rustup toolchain install stable
-            rustup target add ${{ matrix.cargo_targets }}
+            rustup target add "$TARGET"
 
         - name: build release
           if: matrix.os != 'windows-latest'
           shell: bash
+          env:
+            TARGET: ${{ matrix.cargo_targets }}
           run: |
             if [ "${{ contains(matrix.cargo_targets, '-musl') }}" = "true" ]; then
               # Native build on self-hosted linux runners; use musl-gcc from musl-tools.
-              export CARGO_TARGET_$(echo ${{ matrix.cargo_targets }} | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc
+              target_env="$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')"
+              export "CARGO_TARGET_${target_env}_LINKER=musl-gcc"
               export CC=musl-gcc
               # `relocation-model=static` is required so rustc selects the
               # non-PIE musl crt1.o (not rcrt1.o) to match the ET_EXEC binary
@@ -228,11 +238,13 @@ jobs:
               # process segfaults in `_start_c` before reaching `main`.
               export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static -C relocation-model=static -C link-arg=-static"
             fi
-            cargo build --profile optimized-release --all-features --target ${{ matrix.cargo_targets }}
+            cargo build --profile optimized-release --all-features --target "$TARGET"
 
         - name: build release
           if: matrix.os == 'windows-latest'
-          run: cargo build --profile optimized-release --all-features --target ${{ matrix.cargo_targets }}
+          env:
+            TARGET: ${{ matrix.cargo_targets }}
+          run: cargo build --profile optimized-release --all-features --target "$TARGET"
 
         - name: Download awscli (linux x86_64)
           if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'amd64'
@@ -249,7 +261,7 @@ jobs:
             cd ~/awscli && unzip -oq awscliv2.zip
 
         - name: Download awscli (mac)
-          if: matrix.os == 'macos-latest'
+          if: matrix.os == 'macOS-latest'
           run: |
             mkdir -p ~/awscli
             curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o ~/awscli/AWSCLIV2.pkg
@@ -259,7 +271,7 @@ jobs:
           run: sudo ~/awscli/aws/install --update
 
         - name: Install awscli (mac)
-          if: matrix.os == 'macos-latest'
+          if: matrix.os == 'macOS-latest'
           run: sudo installer -pkg ~/awscli/AWSCLIV2.pkg -target /
 
         - name: push release
@@ -269,8 +281,8 @@ jobs:
             AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
             AWS_DEFAULT_REGION: us-west-2
           run: |
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7} --no-progress
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7} --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7}" --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7}" --no-progress
 
         - name: push release latest
           if: matrix.os != 'windows-latest' && matrix.libc != 'musl' && (github.event.inputs.mark_latest == 'true' || github.event_name == 'push')
@@ -279,8 +291,8 @@ jobs:
             AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
             AWS_DEFAULT_REGION: us-west-2
           run: |
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-latest --no-progress
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-latest --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-latest" --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-latest" --no-progress
 
         - name: push docker release
           if: matrix.os == 'ubuntu-latest' && matrix.libc == 'musl'
@@ -289,8 +301,8 @@ jobs:
             AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
             AWS_DEFAULT_REGION: us-west-2
           run: |
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7} --no-progress
-            aws s3 cp ./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7} --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7}" --no-progress
+            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7}" --no-progress
 
         - name: Build archives
           if: matrix.os != 'windows-latest'
@@ -362,7 +374,7 @@ jobs:
             REPOSITORY: ${{ github.repository }}
           run: |
             set -euo pipefail
-            if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.+-]+)?$ ]]; then
+            if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
               echo "::error::invalid release tag: $RELEASE_TAG"
               exit 1
             fi

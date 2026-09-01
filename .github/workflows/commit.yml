@@ -4,7 +4,7 @@ on:
   # Evaluate the base-branch workflow so a fork cannot add a privileged job.
   pull_request_target:
     branches: [main]
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, reopened]
 
 permissions: {}
 
