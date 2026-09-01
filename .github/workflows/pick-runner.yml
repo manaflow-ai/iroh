@@ -92,6 +92,10 @@ on:
         description: JSON array for overflow slots that land on Blacksmith
         type: string
         default: '["blacksmith-4vcpu-ubuntu-2204"]'
+      hosted_fallback_runner:
+        description: JSON array with one GitHub-hosted label for fail-closed routing
+        type: string
+        default: '["ubuntu-latest"]'
       blacksmith_busy_match:
         description: >
           Substring a busy Blacksmith runner's labels must contain to count
@@ -208,6 +212,7 @@ jobs:
           MAX_BLACKSMITH_CONCURRENT: ${{ inputs.max_blacksmith_concurrent }}
           CORE_RUNNER: ${{ inputs.core_runner }}
           OVERFLOW_RUNNER: ${{ inputs.overflow_runner }}
+          HOSTED_FALLBACK_RUNNER: ${{ inputs.hosted_fallback_runner }}
           BS_MATCH: ${{ inputs.blacksmith_busy_match }}
           ORG: ${{ inputs.org }}
           TRUSTED_SOURCE: ${{ github.repository == 'manaflow-ai/iroh' && ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) }}
@@ -220,7 +225,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          HOSTED_RUNNER='["ubuntu-latest"]'
+          # Keep the fail-closed route on a known GitHub-hosted label. The
+          # allowlist prevents a caller typo from turning the fallback into a
+          # self-hosted label. Invalid input uses the safest Linux default.
+          if ! HOSTED_RUNNER="$(jq -cn --argjson candidate "$HOSTED_FALLBACK_RUNNER" '
+            if (($candidate | type) == "array"
+                and ($candidate | length) == 1
+                and (["ubuntu-latest","ubuntu-24.04","ubuntu-22.04",
+                      "windows-latest","windows-2025","windows-2022",
+                      "macos-latest","macos-26","macos-15","macos-14","macos-13"]
+                    | index($candidate[0]) != null))
+            then $candidate
+            else ["ubuntu-latest"]
+            end' 2>/dev/null)"; then
+            HOSTED_RUNNER='["ubuntu-latest"]'
+          fi
           EFFECTIVE_CORE_RUNNER="$CORE_RUNNER"
           EFFECTIVE_OVERFLOW_RUNNER="$OVERFLOW_RUNNER"
           IDLE="unknown"

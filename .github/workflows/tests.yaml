@@ -61,6 +61,7 @@ jobs:
     with:
       core_runner: '["self-hosted","windows","x64"]'
       overflow_runner: '["blacksmith-4vcpu-windows-2025"]'
+      hosted_fallback_runner: '["windows-latest"]'
       blacksmith_busy_match: windows
       max_blacksmith_concurrent: 4
       min_free_runners: 1

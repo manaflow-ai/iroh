@@ -12,6 +12,9 @@ concurrency:
   group: beta-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 env:
   IROH_FORCE_STAGING_RELAYS: "1"
 
@@ -25,6 +28,7 @@ jobs:
   notify:
     needs: tests
     if: always() && github.repository == 'manaflow-ai/iroh'
+    permissions: {}
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results

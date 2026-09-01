@@ -389,23 +389,24 @@ jobs:
         continue-on-error: true
       - uses: ./.github/workflows/sccache-probe
 
-      - name: Setup Environment (PR)
-        if: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
+      - name: Select semver baseline
+        id: semver_baseline
         shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
-          echo "HEAD_COMMIT_SHA=${{ github.event.pull_request.base.sha }}" >> ${GITHUB_ENV}
-      - name: Setup Environment (Push)
-        if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
-        shell: bash
-        run: |
-          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
+          if [[ -n "$PR_BASE_SHA" ]]; then
+            printf 'sha=%s\n' "$PR_BASE_SHA" >> "$GITHUB_OUTPUT"
+          else
+            printf 'sha=%s\n' "$(git rev-parse origin/main)" >> "$GITHUB_OUTPUT"
+          fi
       - name: Check semver
         # uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239
         # Pin the in-org action branch to an immutable commit.
         uses: n0-computer/cargo-semver-checks-action@b49de9133f8849bb51cae32c6bdeb19a5c37e61f
         with:
           package: iroh, iroh-base, iroh-dns, iroh-dns-server, iroh-relay
-          baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
+          baseline-rev: ${{ steps.semver_baseline.outputs.sha }}
           use-cache: false
 
   check_external_types:
