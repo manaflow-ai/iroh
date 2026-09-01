@@ -51,7 +51,9 @@ env:
 
 jobs:
     create-release:
-      if: github.repository == 'manaflow-ai/iroh'
+      if: >-
+        github.repository == 'manaflow-ai/iroh' &&
+        (github.event_name == 'push' || github.ref == 'refs/heads/main')
       name: create-release
       permissions:
         contents: write
@@ -101,7 +103,9 @@ jobs:
           printf 'upload_url=%s\n' "$upload_url" >> "$GITHUB_OUTPUT"
 
     build_release:
-        if: github.repository == 'manaflow-ai/iroh'
+        if: >-
+          github.repository == 'manaflow-ai/iroh' &&
+          (github.event_name == 'push' || github.ref == 'refs/heads/main')
         permissions:
           contents: read
         timeout-minutes: 60
@@ -125,50 +129,49 @@ jobs:
                 release-arch: aarch64
                 libc: gnu
                 cargo_targets: "aarch64-unknown-linux-gnu"
-                runner: [self-hosted, linux, ARM64]
+                runner: ubuntu-24.04-arm
               - name: ubuntu-arm-musl-latest
                 os: ubuntu-latest
                 release-os: linux
                 release-arch: aarch64
                 libc: musl
                 cargo_targets: "aarch64-unknown-linux-musl"
-                runner: [self-hosted, linux, ARM64]
+                runner: ubuntu-24.04-arm
               - name: ubuntu-latest
                 os: ubuntu-latest
                 release-os: linux
                 release-arch: amd64
                 libc: gnu
                 cargo_targets: "x86_64-unknown-linux-gnu"
-                runner: [self-hosted, linux, X64]
+                runner: ubuntu-24.04
               - name: ubuntu-musl-latest
                 os: ubuntu-latest
                 release-os: linux
                 release-arch: amd64
                 libc: musl
                 cargo_targets: "x86_64-unknown-linux-musl"
-                runner: [self-hosted, linux, X64]
+                runner: ubuntu-24.04
               - name: macOS-latest
                 os: macOS-latest
                 release-os: darwin
                 release-arch: x86_64
                 cargo_targets: "x86_64-apple-darwin"
-                runner: [self-hosted, macOS, ARM64]
+                runner: macos-14
               - name: macOS-arm-latest
                 os: macOS-latest
                 release-os: darwin
                 release-arch: aarch64
                 cargo_targets: "aarch64-apple-darwin"
-                runner: [self-hosted, macOS, ARM64]
+                runner: macos-14
               - name: windows-latest
                 os: windows-latest
                 release-os: windows
                 release-arch: amd64
                 cargo_targets: "x86_64-pc-windows-msvc"
-                runner: [self-hosted, windows, X64]
+                runner: windows-2025
         env:
-          # Using self-hosted runners so use local cache for sccache and
-          # not SCCACHE_GHA_ENABLED.
-          # RUSTC_WRAPPER: "sccache"
+          # Release builds run on versioned GitHub-hosted runners. They have
+          # no release credentials; all publishing happens in dedicated jobs.
           RUST_BACKTRACE: full
           RUSTV: ${{ matrix.rust }}
         steps:
@@ -227,7 +230,7 @@ jobs:
             TARGET: ${{ matrix.cargo_targets }}
           run: |
             if [ "${{ contains(matrix.cargo_targets, '-musl') }}" = "true" ]; then
-              # Native build on self-hosted linux runners; use musl-gcc from musl-tools.
+              # Native build on the hosted Linux runner; use musl-gcc from musl-tools.
               target_env="$(printf '%s' "$TARGET" | tr 'a-z-' 'A-Z_')"
               export "CARGO_TARGET_${target_env}_LINKER=musl-gcc"
               export CC=musl-gcc
@@ -245,64 +248,6 @@ jobs:
           env:
             TARGET: ${{ matrix.cargo_targets }}
           run: cargo build --profile optimized-release --all-features --target "$TARGET"
-
-        - name: Download awscli (linux x86_64)
-          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'amd64'
-          run: |
-            mkdir -p ~/awscli
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o ~/awscli/awscliv2.zip
-            cd ~/awscli && unzip -oq awscliv2.zip
-
-        - name: Download awscli (linux aarch64)
-          if: matrix.os == 'ubuntu-latest' && matrix.release-arch == 'aarch64'
-          run: |
-            mkdir -p ~/awscli
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o ~/awscli/awscliv2.zip
-            cd ~/awscli && unzip -oq awscliv2.zip
-
-        - name: Download awscli (mac)
-          if: matrix.os == 'macOS-latest'
-          run: |
-            mkdir -p ~/awscli
-            curl "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o ~/awscli/AWSCLIV2.pkg
-
-        - name: Install awscli (linux)
-          if: matrix.os == 'ubuntu-latest'
-          run: sudo ~/awscli/aws/install --update
-
-        - name: Install awscli (mac)
-          if: matrix.os == 'macOS-latest'
-          run: sudo installer -pkg ~/awscli/AWSCLIV2.pkg -target /
-
-        - name: push release
-          if: matrix.os != 'windows-latest' && matrix.libc != 'musl'
-          env:
-            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-            AWS_DEFAULT_REGION: us-west-2
-          run: |
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7}" --no-progress
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-${GITHUB_SHA::7}" --no-progress
-
-        - name: push release latest
-          if: matrix.os != 'windows-latest' && matrix.libc != 'musl' && (github.event.inputs.mark_latest == 'true' || github.event_name == 'push')
-          env:
-            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-            AWS_DEFAULT_REGION: us-west-2
-          run: |
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-latest" --no-progress
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-latest" --no-progress
-
-        - name: push docker release
-          if: matrix.os == 'ubuntu-latest' && matrix.libc == 'musl'
-          env:
-            AWS_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-            AWS_SECRET_ACCESS_KEY: ${{ secrets.S3_ACCESS_KEY }}
-            AWS_DEFAULT_REGION: us-west-2
-          run: |
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-relay" "s3://vorc/iroh-relay-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7}" --no-progress
-            aws s3 cp "./target/${{ matrix.cargo_targets }}/optimized-release/iroh-dns-server" "s3://vorc/iroh-dns-server-${RELEASE_OS}-${RELEASE_ARCH}-musl-${GITHUB_SHA::7}" --no-progress
 
         - name: Build archives
           if: matrix.os != 'windows-latest'
@@ -330,8 +275,41 @@ jobs:
               Set-Location -Path ..
             }
 
+        # Stage the Linux binaries for the S3 publisher. Keeping these files
+        # in an immutable run artifact removes cloud credentials from every
+        # build matrix cell.
+        - name: Stage Linux release binaries
+          if: matrix.os == 'ubuntu-latest'
+          shell: bash
+          env:
+            TARGET: ${{ matrix.cargo_targets }}
+            RELEASE_OS_VALUE: ${{ matrix.release-os }}
+            RELEASE_ARCH_VALUE: ${{ matrix.release-arch }}
+            LIBC_SUFFIX: ${{ matrix.libc == 'musl' && '-musl' || '' }}
+            BUILD_SHA: ${{ github.sha }}
+          run: |
+            set -euo pipefail
+            mkdir -p release-binaries
+            short_sha="${BUILD_SHA:0:7}"
+            for binary in iroh-relay iroh-dns-server; do
+              source="target/${TARGET}/optimized-release/${binary}"
+              destination="release-binaries/${binary}-${RELEASE_OS_VALUE}-${RELEASE_ARCH_VALUE}${LIBC_SUFFIX}-${short_sha}"
+              test -f "$source"
+              cp -- "$source" "$destination"
+            done
+
+        - name: Attach Linux release binaries
+          if: matrix.os == 'ubuntu-latest'
+          uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+          with:
+            name: iroh-${{ matrix.release-os }}-${{ matrix.release-arch }}${{ matrix.libc == 'musl' && '-musl' || '' }}-binaries
+            path: release-binaries/*
+            if-no-files-found: error
+            compression-level: 0
+            retention-days: 1
+
         # Keep release archives in Actions artifacts until the hosted publish
-        # job uploads them. This build job stays read-only on persistent hosts.
+        # job uploads them. Build jobs have no release credentials.
         - name: attach artifacts
           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
           if : matrix.os != 'windows-latest'
@@ -350,11 +328,97 @@ jobs:
             compression-level: 0
             retention-days: 1
 
+    publish-s3-binaries:
+      name: Publish release binaries
+      # S3 publication is separate from all builds. This job is the only job
+      # that receives the S3 credentials, and it runs on a versioned hosted
+      # runner after the complete build matrix succeeds.
+      if: >-
+        github.repository == 'manaflow-ai/iroh' &&
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      needs: [create-release, build_release]
+      permissions:
+        contents: read
+      runs-on: ubuntu-24.04
+      timeout-minutes: 15
+      steps:
+        - name: Verify release source
+          shell: bash
+          env:
+            GH_TOKEN: ${{ github.token }}
+            RELEASE_TAG: ${{ needs.create-release.outputs.release_version }}
+            EVENT_NAME: ${{ github.event_name }}
+            EVENT_REF: ${{ github.ref }}
+            REPOSITORY: ${{ github.repository }}
+          run: |
+            set -euo pipefail
+            if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "::error::invalid Docker-compatible release tag (no build metadata): $RELEASE_TAG"
+              exit 1
+            fi
+            if [[ "$EVENT_NAME" == "push" && "$EVENT_REF" != "refs/tags/$RELEASE_TAG" ]]; then
+              echo "::error::release tag does not match the pushed tag"
+              exit 1
+            fi
+            if [[ "$EVENT_NAME" == "workflow_dispatch" && "$EVENT_REF" != "refs/heads/main" ]]; then
+              echo "::error::manual publication is allowed only from main"
+              exit 1
+            fi
+            release_json="$(gh api "repos/$REPOSITORY/releases/tags/$RELEASE_TAG")"
+            actual_tag="$(jq -r '.tag_name // empty' <<<"$release_json")"
+            if [[ "$actual_tag" != "$RELEASE_TAG" ]]; then
+              echo "::error::release metadata does not match the requested tag"
+              exit 1
+            fi
+
+        - name: Download release binaries
+          uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0
+          with:
+            pattern: iroh-*-binaries
+            path: release-binaries
+            merge-multiple: true
+
+        - name: Configure AWS credentials
+          uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a
+          with:
+            aws-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+            aws-secret-access-key: ${{ secrets.S3_ACCESS_KEY }}
+            aws-region: us-west-2
+
+        - name: Require and upload release binaries
+          shell: bash
+          env:
+            BUILD_SHA: ${{ github.sha }}
+            MARK_LATEST: ${{ github.event_name == 'push' || inputs.mark_latest == 'true' }}
+          run: |
+            set -euo pipefail
+            short_sha="${BUILD_SHA:0:7}"
+            shopt -s nullglob
+            for binary in iroh-relay iroh-dns-server; do
+              files=("release-binaries/${binary}-linux-"*)
+              if (( ${#files[@]} != 4 )); then
+                echo "::error::expected four Linux ${binary} artifacts, found ${#files[@]}"
+                exit 1
+              fi
+              for source in "${files[@]}"; do
+                filename="${source##*/}"
+                if [[ ! "$filename" =~ ^${binary}-linux-(amd64|aarch64)(-musl)?-${short_sha}$ ]]; then
+                  echo "::error::unexpected release artifact name: $filename"
+                  exit 1
+                fi
+                aws s3 cp "$source" "s3://vorc/$filename" --no-progress
+                if [[ "$MARK_LATEST" == "true" && "$filename" != *-musl-${short_sha} ]]; then
+                  latest="${filename%-${short_sha}}-latest"
+                  aws s3 cp "$source" "s3://vorc/$latest" --no-progress
+                fi
+              done
+            done
+
     publish-release-assets:
       name: Publish release assets
       if: >-
         github.repository == 'manaflow-ai/iroh' &&
-        (github.event_name == 'push' || inputs.upload_artifacts == 'true')
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.upload_artifacts == 'true'))
       needs: [create-release, build_release]
       permissions:
         # Only this hosted job needs to mutate the release.
@@ -424,8 +488,10 @@ jobs:
             asset_path: release-assets/*
 
     docker:
-      if: github.repository == 'manaflow-ai/iroh'
-      needs: build_release
+      if: >-
+        github.repository == 'manaflow-ai/iroh' &&
+        (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      needs: [build_release, publish-s3-binaries]
       uses: './.github/workflows/docker.yaml'
       secrets:
         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
