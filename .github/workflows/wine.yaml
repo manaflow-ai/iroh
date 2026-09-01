@@ -1,11 +1,12 @@
 name: Wine Tests
 
 on:
+  pull_request:
+    types: [opened, synchronize, reopened]
   push:
     branches: [main]
-  # Keep the workflow definition on the base branch before using a persistent
-  # self-hosted runner.
   pull_request_target:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
@@ -16,6 +17,8 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
 
 permissions:
   contents: read
@@ -24,28 +27,31 @@ jobs:
   pick-runner:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      github.event_name != 'merge_group'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   wine_test:
     name: Wine Sanity Check
     needs: pick-runner
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
     # runs-on: [self-hosted, linux, X64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          repository: ${{ env.PR_REPOSITORY }}
+          ref: ${{ env.PR_REF }}
           persist-credentials: false
 
       - name: Install Wine

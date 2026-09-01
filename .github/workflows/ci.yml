@@ -1,8 +1,12 @@
 name: CI
 
 on:
-  # Use the base-branch workflow for PRs. This prevents a fork from changing
-  # runner or permission policy in the workflow it asks us to execute.
+  # pull_request keeps required checks attached to the PR merge commit and
+  # gives fork runs GitHub's read-only token and isolated cache scope.
+  pull_request:
+    types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
+  # The target trigger is used only for trusted same-repository jobs. Every
+  # target job below rejects fork and Dependabot code before checkout.
   pull_request_target:
     types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
   merge_group:
@@ -13,9 +17,9 @@ on:
 permissions:
   contents: read
 
-# Fork validation below is intentionally limited to hosted runners and this
-# read-only token. Privileged jobs keep the same-repository guard. GitHub
-# treats Dependabot pull requests as forked, so the same policy applies.
+# Pull-request jobs use hosted runners for untrusted sources. Target-triggered
+# jobs execute only trusted same-repository code; Dependabot is treated as
+# untrusted even when its branch is in this repository.
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -38,9 +42,11 @@ env:
       'on' || ''
     }}
   IROH_FORCE_STAGING_RELAYS: "1"
-  PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-  PR_REF: ${{ github.event.pull_request.head.sha || github.sha }}
-  ALLOW_UNSAFE_PR_CHECKOUT: ${{ github.event_name == 'pull_request_target' && (github.event.pull_request.head.repo.full_name != github.repository || github.event.pull_request.user.login == 'dependabot[bot]') }}
+  # Use GitHub's generated merge commit for pull requests. It exists in the
+  # base repository, so target jobs never need to checkout a fork ref.
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
+  ALLOW_UNSAFE_PR_CHECKOUT: 'false'
 
 jobs:
   pick-runner:
@@ -60,7 +66,7 @@ jobs:
     name: CI Test Suite
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/tests.yaml"
     secrets:
@@ -75,6 +81,7 @@ jobs:
     name: Cross Build Only
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
@@ -143,6 +150,7 @@ jobs:
     name: Android Build & Test
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 60
     # runs-on: [self-hosted, linux, X64]
@@ -282,6 +290,7 @@ jobs:
     name: Cross Test
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     needs: pick-runner
@@ -337,7 +346,9 @@ jobs:
 
   wasm_test:
     name: Build & test wasm32 for browsers
-    if: github.repository == 'manaflow-ai/iroh'
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_4) }}
     # runs-on: [self-hosted, linux, X64]
@@ -395,7 +406,9 @@ jobs:
         run: cargo test -p iroh --test integration --target=wasm32-unknown-unknown
 
   check_semver:
-    if: github.repository == 'manaflow-ai/iroh'
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_5) }}
     # runs-on: [self-hosted, linux, X64]
@@ -439,6 +452,7 @@ jobs:
     name: Check external types in public API
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_9) }}
@@ -480,6 +494,10 @@ jobs:
   check_fmt:
     timeout-minutes: 30
     name: Checking fmt
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
@@ -503,7 +521,9 @@ jobs:
     timeout-minutes: 30
     name: Checking docs
     needs: pick-runner
-    if: github.repository == 'manaflow-ai/iroh'
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_6) }}
     # runs-on: [self-hosted, linux, X64]
     env:
@@ -529,7 +549,9 @@ jobs:
 
   clippy_check:
     timeout-minutes: 30
-    if: github.repository == 'manaflow-ai/iroh'
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
     runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_7) }}
     # runs-on: [self-hosted, linux, X64]
@@ -564,6 +586,10 @@ jobs:
   check_optional_deps:
     timeout-minutes: 10
     name: Check optional deps are absent without features
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -590,6 +616,7 @@ jobs:
   msrv:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     timeout-minutes: 30
     name: Minimal Supported Rust Version
@@ -620,6 +647,10 @@ jobs:
   cargo_deny:
     timeout-minutes: 30
     name: cargo deny
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -643,7 +674,8 @@ jobs:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
       github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      github.event_name != 'pull_request' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/netsim_runner.yaml"
     secrets:
@@ -663,6 +695,10 @@ jobs:
 
   codespell:
     timeout-minutes: 30
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1

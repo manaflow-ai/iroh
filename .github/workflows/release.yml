@@ -71,10 +71,10 @@ jobs:
             # See: https://github.community/t5/GitHub-Actions/How-to-get-just-the-tag-name/m-p/32167/highlight/true#M1027
             release_version="${GITHUB_REF#refs/tags/}"
           fi
-          # Accept SemVer prerelease/build segments, but reject ambiguous
-          # dotted suffixes such as v1.2.3.foo.
-          if [[ ! "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-            echo "::error::release version must be a semantic version, got '$release_version'"
+          # Docker tags do not permit '+', so accept the SemVer core and
+          # prerelease portion but reject build metadata at the release gate.
+          if [[ ! "$release_version" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+            echo "::error::release version must be a Docker-compatible semantic version (no build metadata), got '$release_version'"
             exit 1
           fi
           printf 'RELEASE_VERSION=%s\n' "$release_version" >> "$GITHUB_ENV"
@@ -374,8 +374,8 @@ jobs:
             REPOSITORY: ${{ github.repository }}
           run: |
             set -euo pipefail
-            if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
-              echo "::error::invalid release tag: $RELEASE_TAG"
+            if [[ ! "$RELEASE_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]; then
+              echo "::error::invalid Docker-compatible release tag (no build metadata): $RELEASE_TAG"
               exit 1
             fi
             if [[ "$EVENT_NAME" == "push" && "$EVENT_REF" != "refs/tags/$RELEASE_TAG" ]]; then

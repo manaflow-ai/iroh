@@ -1,7 +1,12 @@
 name: Commits
 
 on:
-  # Evaluate the base-branch workflow so a fork cannot add a privileged job.
+  # Keep the check attached to the PR merge commit. This workflow has no
+  # secrets and no checkout, so the pull_request run is safe for forks.
+  pull_request:
+    branches: [main]
+    types: [opened, edited, synchronize, reopened]
+  # Evaluate the base-branch workflow as defense in depth for trusted events.
   pull_request_target:
     branches: [main]
     types: [opened, edited, synchronize, reopened]

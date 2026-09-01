@@ -33,14 +33,16 @@ env:
   CRATES_LIST: "iroh,iroh-bench,iroh-dns-server,iroh-relay"
   IROH_FORCE_STAGING_RELAYS: "1"
   NEXTEST_VERSION: "0.9.80"
-  PR_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-  PR_REF: ${{ inputs.git-ref || github.event.pull_request.head.sha || github.sha }}
+  PR_REPOSITORY: ${{ github.repository }}
+  PR_REF: ${{ inputs.git-ref || (github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number)) || github.sha }}
+  # All checkout refs are base-repository merge refs. Never opt out of
+  # checkout's fork protection in this reusable workflow.
+  ALLOW_UNSAFE_PR_CHECKOUT: 'false'
 
 jobs:
   pick-runner:
     if: >-
-      github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
@@ -56,8 +58,7 @@ jobs:
   # independent Blacksmith cap of 4 (see blacksmith_busy_match: windows).
   pick-runner-windows:
     if: >-
-      github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","windows","x64"]'
@@ -79,8 +80,7 @@ jobs:
   # self-hosted route for trusted repository events.
   pick-runner-macos:
     if: >-
-      github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      github.repository == 'manaflow-ai/iroh'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","macOS","ARM64"]'
@@ -102,7 +102,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -171,6 +171,7 @@ jobs:
           repository: ${{ env.PR_REPOSITORY }}
           ref: ${{ env.PR_REF }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install ${{ matrix.rust }} rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
@@ -267,7 +268,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -313,6 +314,7 @@ jobs:
           repository: ${{ env.PR_REPOSITORY }}
           ref: ${{ env.PR_REF }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install ${{ matrix.rust }}
         run: |
@@ -410,7 +412,7 @@ jobs:
   minimal-crates:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
@@ -434,6 +436,7 @@ jobs:
           repository: ${{ env.PR_REPOSITORY }}
           ref: ${{ env.PR_REF }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
       - uses: dtolnay/rust-toolchain@7c8d7d138f5c09cef361f8214cf96882cd029cdb
       - name: cargo check
         run: |
@@ -445,7 +448,7 @@ jobs:
     name: "Minimal Crates (Windows)"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group'
+      (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -481,6 +484,7 @@ jobs:
           repository: ${{ env.PR_REPOSITORY }}
           ref: ${{ env.PR_REF }}
           persist-credentials: false
+          allow-unsafe-pr-checkout: ${{ env.ALLOW_UNSAFE_PR_CHECKOUT }}
 
       - name: Install Rust nightly
         run: |
