@@ -692,7 +692,7 @@ jobs:
       METRO_TOKEN: ${{ secrets.METRO_TOKEN }}
       METRO_ENDPOINT: ${{ secrets.METRO_ENDPOINT }}
     with:
-      branch: ${{ github.event.pull_request.head.sha || github.ref }}
+      branch: ${{ github.event.pull_request.number && format('refs/pull/{0}/merge', github.event.pull_request.number) || github.ref }}
       max_workers: 6
       netsim_branch: "main"
       sim_paths: ${{ (github.event_name == 'pull_request' || github.event_name == 'pull_request_target') && 'sims/integration' || 'sims/iroh/iroh.json,sims/integration' }}

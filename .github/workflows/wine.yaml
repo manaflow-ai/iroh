@@ -27,7 +27,8 @@ jobs:
   # Base-controlled hosted validation for fork PRs. No secrets, write
   # permissions, self-hosted labels, or persistent cache are available here.
   fork_validation:
-    name: Wine Sanity Check (hosted fork)
+    # Preserve the protected status-check context used by trusted runs.
+    name: Wine Sanity Check
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
       github.event_name == 'pull_request_target' &&

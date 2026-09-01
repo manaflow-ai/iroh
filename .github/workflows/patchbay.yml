@@ -29,7 +29,8 @@ jobs:
   # fork code. It has a hosted runner, a read-only token, no secrets, and no
   # persistent cache. The checkout opt-in is limited to this isolated lane.
   fork_validation:
-    name: Patchbay Tests (hosted fork)
+    # Preserve the protected status-check context used by trusted runs.
+    name: Patchbay Tests
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
       github.event_name == 'pull_request_target' &&
