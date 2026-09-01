@@ -40,8 +40,7 @@ jobs:
   pick-runner:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      github.event_name != 'merge_group'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       min_free_runners: 3
@@ -58,8 +57,7 @@ jobs:
   pick-runner-windows:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      github.event_name != 'merge_group'
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","windows","x64"]'
@@ -76,14 +74,36 @@ jobs:
           secrets.RUNNER_READ_TOKEN || ''
         }}
 
+  # macOS is normally a persistent self-hosted lane. The picker changes every
+  # slot to macos-latest for fork and Dependabot PRs, while preserving the
+  # self-hosted route for trusted repository events.
+  pick-runner-macos:
+    if: >-
+      github.repository == 'manaflow-ai/iroh' &&
+      github.event_name != 'merge_group'
+    uses: "./.github/workflows/pick-runner.yml"
+    with:
+      core_runner: '["self-hosted","macOS","ARM64"]'
+      overflow_runner: '["self-hosted","macOS","ARM64"]'
+      hosted_fallback_runner: '["macos-latest"]'
+      blacksmith_busy_match: macos
+      max_blacksmith_concurrent: 0
+      min_free_runners: 0
+    secrets:
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
+
   build_and_test_nix:
     timeout-minutes: 30
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
-    needs: pick-runner
+      github.event_name != 'merge_group'
+    needs: [pick-runner, pick-runner-macos]
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
       fail-fast: false
@@ -111,25 +131,25 @@ jobs:
               release-os: linux                                                                                     
               release-arch: amd64     
               runs_on: ${{ needs.pick-runner.outputs.overflow_3 }}
-            # mac cells always stay on self-hosted mac (not in the routing pool)                                                                                           
+            # mac cells use the picker so untrusted sources stay hosted.
             - name: macOS-arm-latest                                                                                                                                       
               features: all                                                                                                                                                
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                                                                           
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'                                                                                                                   
+              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_1 }}
             - name: macOS-arm-latest                                                                                
               features: none                                                                                                                                               
               os: macOS-latest
               release-os: darwin                                                                                                                                           
               release-arch: aarch64                                                                                 
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_2 }}
             - name: macOS-arm-latest                                                                                                                                       
               features: default
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                    
               release-arch: aarch64   
-              runs_on: '["self-hosted","macOS","ARM64"]'
+              runs_on: ${{ needs.pick-runner-macos.outputs.overflow_3 }}
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -247,8 +267,7 @@ jobs:
     name: "Tests"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      github.event_name != 'merge_group'
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:
@@ -304,6 +323,10 @@ jobs:
 
       - name: Cache cargo-nextest
         id: cache-nextest
+        # A fork PR must not read or write the shared base-branch cache.
+        if: >-
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
         with:
           path: ~/.cargo/bin/cargo-nextest.exe
@@ -387,9 +410,9 @@ jobs:
   minimal-crates:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
-    runs-on: ${{ matrix.runner }}
+      github.event_name != 'merge_group'
+    needs: [pick-runner, pick-runner-macos]
+    runs-on: ${{ fromJSON(matrix.runner) }}
     strategy:
       fail-fast: false
       matrix:
@@ -399,12 +422,12 @@ jobs:
             os: ubuntu-latest
             release-os: linux
             release-arch: amd64
-            runner: [self-hosted, linux, X64]
+            runner: ${{ needs.pick-runner.outputs.overflow_10 }}
           - name: macOS-arm-latest
             os: macOS-latest
             release-os: darwin
             release-arch: aarch64
-            runner: [self-hosted, macOS, ARM64]
+            runner: ${{ needs.pick-runner-macos.outputs.overflow_4 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -422,8 +445,7 @@ jobs:
     name: "Minimal Crates (Windows)"
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
-      github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
+      github.event_name != 'merge_group'
     needs: pick-runner-windows
     runs-on: ${{ fromJSON(matrix.runs_on) }}
     strategy:

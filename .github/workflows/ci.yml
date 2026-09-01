@@ -61,11 +61,15 @@ jobs:
     if: >-
       github.repository == 'manaflow-ai/iroh' &&
       github.event_name != 'merge_group' &&
-      ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || ! contains(github.event.pull_request.labels.*.name, 'flaky-test'))
     uses: "./.github/workflows/tests.yaml"
     secrets:
-      RUNNER_READ_TOKEN: ${{ secrets.RUNNER_READ_TOKEN }}
+      RUNNER_READ_TOKEN: >-
+        ${{
+          github.event_name != 'merge_group' &&
+          ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]')) &&
+          secrets.RUNNER_READ_TOKEN || ''
+        }}
 
   cross_build:
     name: Cross Build Only
