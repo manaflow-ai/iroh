@@ -178,11 +178,11 @@ jobs:
         - name: Checkout
           if: inputs.base_hash == ''
           uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        - name: Guard deprecated macOS runners
-          run: bash scripts/check-runner-labels.sh
           with:
             submodules: recursive
             persist-credentials: false
+        - name: Guard deprecated macOS runners
+          run: bash scripts/check-runner-labels.sh
 
         - name: Checkout specified commit
           if: inputs.base_hash != ''
