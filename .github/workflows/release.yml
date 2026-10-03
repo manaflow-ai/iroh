@@ -175,11 +175,11 @@ jobs:
           RUST_BACKTRACE: full
           RUSTV: ${{ matrix.rust }}
         steps:
-        - name: Guard deprecated macOS runners
-          run: ! grep -R -nE "macos-14(-large|-xlarge)?" .github/workflows .github/actions 2>/dev/null
         - name: Checkout
           if: inputs.base_hash == ''
           uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        - name: Guard deprecated macOS runners
+          run: bash scripts/check-runner-labels.sh
           with:
             submodules: recursive
             persist-credentials: false
