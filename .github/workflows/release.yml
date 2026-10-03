@@ -156,13 +156,13 @@ jobs:
                 release-os: darwin
                 release-arch: x86_64
                 cargo_targets: "x86_64-apple-darwin"
-                runner: macos-14
+                runner: macos-15
               - name: macOS-arm-latest
                 os: macOS-latest
                 release-os: darwin
                 release-arch: aarch64
                 cargo_targets: "aarch64-apple-darwin"
-                runner: macos-14
+                runner: macos-15
               - name: windows-latest
                 os: windows-latest
                 release-os: windows
@@ -175,6 +175,8 @@ jobs:
           RUST_BACKTRACE: full
           RUSTV: ${{ matrix.rust }}
         steps:
+        - name: Guard deprecated macOS runners
+          run: ! grep -R -nE "macos-14(-large|-xlarge)?" .github/workflows .github/actions 2>/dev/null
         - name: Checkout
           if: inputs.base_hash == ''
           uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
