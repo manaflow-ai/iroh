@@ -127,7 +127,10 @@ jobs:
       github.repository == 'manaflow-ai/iroh' &&
       github.event_name != 'merge_group' &&
       ((github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # runner-policy-exception: GitHub-hosted on purpose. The mininet/OVS sims
+    # hang with no output until the 45-minute timeout on Blacksmith VMs
+    # (run 40659531018, 2026-10-28). Public repo: hosted minutes are free.
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
