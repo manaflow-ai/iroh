@@ -22,6 +22,9 @@ env:
 
 permissions:
   contents: read
+  # pick-runner.yml (called directly or through tests.yaml) asks for
+  # actions: read; a caller must grant it or the run fails to start.
+  actions: read
 
 jobs:
   # Base-controlled hosted validation for fork PRs. No secrets, write

@@ -14,6 +14,9 @@ on:
 
 permissions:
   contents: read
+  # pick-runner.yml (called directly or through tests.yaml) asks for
+  # actions: read; a caller must grant it or the run fails to start.
+  actions: read
 
 # Pull-request jobs use hosted runners for untrusted sources. Target-triggered
 # jobs execute only trusted same-repository code; Dependabot is treated as
