@@ -96,7 +96,9 @@ on:
       hosted_fallback_runner:
         description: JSON array with one GitHub-hosted label for fail-closed routing
         type: string
-        default: '["ubuntu-latest"]'
+        # manaflow-ai has no persistent runners: the fail-closed route is an
+        # ephemeral Blacksmith VM, not a GitHub-hosted image.
+        default: '["blacksmith-4vcpu-ubuntu-2404"]'
       blacksmith_busy_match:
         description: >
           Substring a busy Blacksmith runner's labels must contain to count
@@ -233,14 +235,15 @@ jobs:
           if ! HOSTED_RUNNER="$(jq -cn --argjson candidate "$HOSTED_FALLBACK_RUNNER" '
             if (($candidate | type) == "array"
                 and ($candidate | length) == 1
-                and (["ubuntu-latest","ubuntu-24.04","ubuntu-22.04",
+                and (["blacksmith-4vcpu-ubuntu-2404","blacksmith-4vcpu-windows-2025","blacksmith-6vcpu-macos-15",
+                      "ubuntu-latest","ubuntu-24.04","ubuntu-22.04",
                       "windows-latest","windows-2025","windows-2022",
                       "macos-latest","macos-26","macos-15","macos-14","macos-13"]
                     | index($candidate[0]) != null))
             then $candidate
-            else ["ubuntu-latest"]
+            else ["blacksmith-4vcpu-ubuntu-2404"]
             end' 2>/dev/null)"; then
-            HOSTED_RUNNER='["ubuntu-latest"]'
+            HOSTED_RUNNER='["blacksmith-4vcpu-ubuntu-2404"]'
           fi
           EFFECTIVE_CORE_RUNNER="$CORE_RUNNER"
           EFFECTIVE_OVERFLOW_RUNNER="$OVERFLOW_RUNNER"

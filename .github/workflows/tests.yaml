@@ -73,7 +73,7 @@ jobs:
     with:
       core_runner: '["self-hosted","windows","x64"]'
       overflow_runner: '["blacksmith-4vcpu-windows-2025"]'
-      hosted_fallback_runner: '["windows-latest"]'
+      hosted_fallback_runner: '["blacksmith-4vcpu-windows-2025"]'
       blacksmith_busy_match: windows
       max_blacksmith_concurrent: 4
       min_free_runners: 1
@@ -94,8 +94,8 @@ jobs:
     uses: "./.github/workflows/pick-runner.yml"
     with:
       core_runner: '["self-hosted","macOS","ARM64"]'
-      overflow_runner: '["self-hosted","macOS","ARM64"]'
-      hosted_fallback_runner: '["macos-latest"]'
+      overflow_runner: '["blacksmith-6vcpu-macos-15"]'
+      hosted_fallback_runner: '["blacksmith-6vcpu-macos-15"]'
       blacksmith_busy_match: macos
       max_blacksmith_concurrent: 0
       min_free_runners: 0
