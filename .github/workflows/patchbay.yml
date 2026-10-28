@@ -83,7 +83,12 @@ jobs:
       github.repository == 'manaflow-ai/iroh' &&
       (github.event_name != 'pull_request_target' || (github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'))
     needs: pick-runner
-    runs-on: ${{ fromJSON(needs.pick-runner.outputs.overflow_1) }}
+    # runner-policy-exception: GitHub-hosted on purpose. add_faster_link_client
+    # and add_faster_link_server time out (wait_selected 15s, no path switch)
+    # on Blacksmith VMs and pass on GitHub's Ubuntu image (2026-10-28); the
+    # repo is public, so hosted minutes are free. Revisit once the netns path
+    # switch works on Blacksmith's kernel.
+    runs-on: ubuntu-24.04
     env:
       RUSTC_WRAPPER: "sccache"
     steps:
