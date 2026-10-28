@@ -164,6 +164,10 @@ jobs:
         cd ../chuck/netsim
         sudo apt update
         ./setup.sh
+        # setup.sh's pip falls back to a user install where site-packages is
+        # not writable (Blacksmith VMs), but the sims run as root via sudo.
+        # Install the same requirements for root too.
+        sudo python3 -m pip install --quiet --break-system-packages -r scripts/requirements.txt
         ./cleanup.sh || true
 
     - name: Copy sim configs
