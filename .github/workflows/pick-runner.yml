@@ -183,7 +183,7 @@ jobs:
     # pull requests are handled without the runner-read secret and resolve all
     # slots to the hosted fallback below.
     if: github.repository == 'manaflow-ai/iroh'
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 2
     outputs:
       core: ${{ steps.p.outputs.core }}

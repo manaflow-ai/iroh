@@ -52,7 +52,7 @@ permissions: {}
 jobs:
   add-to-project:
     name: Add to project board
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         id: app-token

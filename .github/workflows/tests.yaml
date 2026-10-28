@@ -122,41 +122,41 @@ jobs:
             # ubuntu cells route via pick-runner slots 1-3                                                                                                                 
             - name: ubuntu-latest                                                                                   
               features: all                                                                                                                                                
-              os: ubuntu-latest
+              os: blacksmith-4vcpu-ubuntu-2404
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                                                                          
-              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_1 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-ubuntu-2404"]' || needs.pick-runner.outputs.overflow_1 }}
             - name: ubuntu-latest                                                                                                                                          
               features: none                                                                                                                                               
-              os: ubuntu-latest       
+              os: blacksmith-4vcpu-ubuntu-2404       
               release-os: linux                                                                                                                                            
               release-arch: amd64                                                                                   
-              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_2 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-ubuntu-2404"]' || needs.pick-runner.outputs.overflow_2 }}
             - name: ubuntu-latest                                                                                                                                          
               features: default
-              os: ubuntu-latest                                                                                                                                            
+              os: blacksmith-4vcpu-ubuntu-2404                                                                                                                                            
               release-os: linux                                                                                     
               release-arch: amd64     
-              runs_on: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_3 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-ubuntu-2404"]' || needs.pick-runner.outputs.overflow_3 }}
             # mac cells use the picker so untrusted sources stay hosted.
             - name: macOS-arm-latest                                                                                                                                       
               features: all                                                                                                                                                
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                                                                           
               release-arch: aarch64   
-              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_1 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-6vcpu-macos-15"]' || needs.pick-runner-macos.outputs.overflow_1 }}
             - name: macOS-arm-latest                                                                                
               features: none                                                                                                                                               
               os: macOS-latest
               release-os: darwin                                                                                                                                           
               release-arch: aarch64                                                                                 
-              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_2 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-6vcpu-macos-15"]' || needs.pick-runner-macos.outputs.overflow_2 }}
             - name: macOS-arm-latest                                                                                                                                       
               features: default
               os: macOS-latest                                                                                                                                             
               release-os: darwin                                                                                    
               release-arch: aarch64   
-              runs_on: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_3 }}
+              runs_on: ${{ inputs.hosted_only && '["blacksmith-6vcpu-macos-15"]' || needs.pick-runner-macos.outputs.overflow_3 }}
     env:
       # Using self-hosted runners so use local cache for sccache and
       # not SCCACHE_GHA_ENABLED.
@@ -291,15 +291,15 @@ jobs:
           - name: windows-latest
             features: all
             os: windows
-            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_1 }}
+            runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-windows-2025"]' || needs.pick-runner-windows.outputs.overflow_1 }}
           - name: windows-latest
             features: none
             os: windows
-            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_2 }}
+            runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-windows-2025"]' || needs.pick-runner-windows.outputs.overflow_2 }}
           - name: windows-latest
             features: default
             os: windows
-            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_3 }}
+            runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-windows-2025"]' || needs.pick-runner-windows.outputs.overflow_3 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).
@@ -428,15 +428,15 @@ jobs:
         name: [ubuntu-latest, macOS-arm-latest] # TODO: windows
         include:
           - name: ubuntu-latest
-            os: ubuntu-latest
+            os: blacksmith-4vcpu-ubuntu-2404
             release-os: linux
             release-arch: amd64
-            runner: ${{ inputs.hosted_only && '["ubuntu-latest"]' || needs.pick-runner.outputs.overflow_10 }}
+            runner: ${{ inputs.hosted_only && '["blacksmith-4vcpu-ubuntu-2404"]' || needs.pick-runner.outputs.overflow_10 }}
           - name: macOS-arm-latest
             os: macOS-latest
             release-os: darwin
             release-arch: aarch64
-            runner: ${{ inputs.hosted_only && '["macos-latest"]' || needs.pick-runner-macos.outputs.overflow_4 }}
+            runner: ${{ inputs.hosted_only && '["blacksmith-6vcpu-macos-15"]' || needs.pick-runner-macos.outputs.overflow_4 }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -469,7 +469,7 @@ jobs:
           # distinct slot (4) so it can run alongside the 3 build cells
           - name: windows-latest
             os: windows
-            runs_on: ${{ inputs.hosted_only && '["windows-latest"]' || needs.pick-runner-windows.outputs.overflow_4 }}
+            runs_on: ${{ inputs.hosted_only && '["blacksmith-4vcpu-windows-2025"]' || needs.pick-runner-windows.outputs.overflow_4 }}
     env:
       # sccache backend is selected at runtime in "Configure sccache backend":
       # local disk on self-hosted, GHA-backed on Blacksmith (ephemeral).

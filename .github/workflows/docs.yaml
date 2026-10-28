@@ -29,7 +29,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     outputs:
       number: ${{ steps.resolve.outputs.number }}
       ref: ${{ steps.resolve.outputs.ref }}
@@ -91,7 +91,7 @@ jobs:
     timeout-minutes: 30
     name: Docs preview
     if: ${{ github.repository == 'manaflow-ai/iroh' && needs.resolve_pr.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
